@@ -157,6 +157,7 @@ flutter:
     - assets/practice_art/
     - assets/demo/
     - assets/demo/i18n/
+    - assets/demo/video/
     # OQ-041/044: call tones and in-app message sounds.
     - assets/sounds/
 
