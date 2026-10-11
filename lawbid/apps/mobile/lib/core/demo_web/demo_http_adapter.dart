@@ -18,6 +18,18 @@ const bool kDemoMode = bool.fromEnvironment('DEMO_MODE');
 /// `cursor` that was not recorded gets an empty last page, so infinite
 /// scrolling stops instead of repeating the first page. Writes succeed and
 /// change nothing.
+/// Test-server address for the web demo: `?api=https://host/api/v1` in the
+/// page link, or `--dart-define=DEMO_SERVER_URL=...` at build time. Empty
+/// means the built-in offline data answers every call.
+String get demoServerUrl {
+  final fromLink = Uri.base.queryParameters['api'];
+  if (fromLink != null && fromLink.startsWith('http')) return fromLink;
+  return const String.fromEnvironment('DEMO_SERVER_URL');
+}
+
+/// True when this demo build talks to [demoServerUrl] instead of the data.
+bool get demoUsesServer => kDemoMode && demoServerUrl.isNotEmpty;
+
 class DemoHttpClientAdapter implements HttpClientAdapter {
   DemoHttpClientAdapter();
 
@@ -50,6 +62,9 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
 
     if (method != 'GET') return _ok(_write(method, path));
 
+    final i18n = await _i18n(path, options.uri.queryParameters);
+    if (i18n != null) return _ok(i18n);
+
     final role = data[_role] as Map<String, dynamic>? ?? const {};
     final shared = data['shared'] as Map<String, dynamic>? ?? const {};
     final sources = <Map<String, dynamic>>[role, shared];
@@ -69,6 +84,14 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
       final Object? hit = source['GET $path'];
       if (hit != null) return _ok(hit);
     }
+    final similar = _similar(sources, path);
+    if (similar != null) return _ok(similar);
+    if (!_hasId(path)) {
+      return _ok({
+        'data': const <Object>[],
+        'meta': {'nextCursor': null},
+      });
+    }
     return _json(
       404,
       {
@@ -78,6 +101,70 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
         },
       },
     );
+  }
+
+  static final _idSegment = RegExp(
+    r'^([0-9a-fA-F-]{20,}|[0-9]+|c[a-z0-9]{20,})$',
+  );
+
+  static bool _hasId(String path) => path.split('/').any(_idSegment.hasMatch);
+
+  static String _shape(String path) =>
+      path.split('/').map((s) => _idSegment.hasMatch(s) ? '*' : s).join('/');
+
+  /// A detail screen opened for an id the recording never saw gets the
+  /// recorded detail of the same kind (another post, another profile).
+  static Object? _similar(List<Map<String, dynamic>> sources, String path) {
+    if (!_hasId(path)) return null;
+    final shape = _shape(path);
+    for (final source in sources) {
+      for (final entry in source.entries) {
+        if (!entry.key.startsWith('GET ') || entry.key.contains('?')) continue;
+        if (_shape(entry.key.substring(4)) == shape) return entry.value;
+      }
+    }
+    return null;
+  }
+
+  static final Map<String, Object> _i18nCache = {};
+
+  /// Languages and bundles come from assets/demo/i18n (generated from
+  /// shared/localization by tool/web_preview/gen_demo_i18n.py).
+  static Future<Object?> _i18n(String path, Map<String, String> q) async {
+    try {
+      if (path == '/i18n/languages') {
+        final raw =
+            await rootBundle.loadString('assets/demo/i18n/languages.json');
+        return {'data': jsonDecode(raw)};
+      }
+      const prefix = '/i18n/bundle/';
+      if (path.startsWith(prefix)) {
+        final lang = path.substring(prefix.length);
+        final since = int.tryParse(q['since'] ?? '');
+        if (since != null && since >= 1) {
+          return {
+            'data': {
+              'lang': lang,
+              'version': 1,
+              'translations': const <String, Object>{}
+            },
+          };
+        }
+        final cached = _i18nCache[lang];
+        if (cached != null) return cached;
+        final raw = await rootBundle.loadString('assets/demo/i18n/$lang.json');
+        return _i18nCache[lang] = {
+          'data': {
+            'lang': lang,
+            'version': 1,
+            'translations': jsonDecode(raw),
+          },
+        };
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
   }
 
   static Future<String> _readBody(Stream<Uint8List>? stream) async {

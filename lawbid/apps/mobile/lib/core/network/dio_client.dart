@@ -30,12 +30,16 @@ final dioProvider = Provider<Dio>((ref) {
     BaseOptions(
       // Per-flavor default, overridable with --dart-define API_BASE_URL
       // (core/config/app_environment.dart).
-      baseUrl: ref.watch(appEnvironmentProvider).apiBaseUrl,
+      baseUrl: demoUsesServer
+          ? demoServerUrl
+          : ref.watch(appEnvironmentProvider).apiBaseUrl,
       connectTimeout: const Duration(seconds: 15),
       receiveTimeout: const Duration(seconds: 15),
     ),
   );
-  if (kDemoMode) dio.httpClientAdapter = DemoHttpClientAdapter();
+  if (kDemoMode && !demoUsesServer) {
+    dio.httpClientAdapter = DemoHttpClientAdapter();
+  }
   dio.interceptors.add(HeadersInterceptor(ref));
   dio.interceptors.add(AppUpdateInterceptor(ref));
   dio.interceptors.add(AccountSuspendedInterceptor(ref));
@@ -57,12 +61,15 @@ final dioProvider = Provider<Dio>((ref) {
 /// docs/03 §2.2): NO app interceptors — the bearer token, app headers and
 /// the API retry policy must never reach the storage host. Only upload
 /// repositories use it; overridable in tests.
-final storageDioProvider = Provider<Dio>(
-  (ref) => Dio(
+final storageDioProvider = Provider<Dio>((ref) {
+  final dio = Dio(
     BaseOptions(
       connectTimeout: const Duration(seconds: 15),
       sendTimeout: const Duration(seconds: 60),
       receiveTimeout: const Duration(seconds: 30),
     ),
-  ),
-);
+  );
+  if (kDemoMode && !demoUsesServer)
+    dio.httpClientAdapter = DemoHttpClientAdapter();
+  return dio;
+});
