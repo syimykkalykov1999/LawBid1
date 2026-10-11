@@ -156,6 +156,7 @@ flutter:
     - assets/fonts/OFL-Inter.txt
     - assets/practice_art/
     - assets/demo/
+    - assets/demo/i18n/
     # OQ-041/044: call tones and in-app message sounds.
     - assets/sounds/
 

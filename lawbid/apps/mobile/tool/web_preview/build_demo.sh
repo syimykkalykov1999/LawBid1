@@ -22,6 +22,8 @@ DRIFT="$(ver drift)"; SQLITE="$(ver sqlite3)"
 [[ -f web/sqlite3.wasm ]] || curl -fsSL -o web/sqlite3.wasm \
   "https://github.com/simolus3/sqlite3.dart/releases/download/sqlite3-$SQLITE/sqlite3.wasm"
 
+python3 -c 'import openpyxl' 2>/dev/null || python3 -m pip install -q openpyxl
+python3 tool/web_preview/gen_demo_i18n.py
 flutter pub get >/dev/null
 dart run build_runner build --delete-conflicting-outputs >/dev/null
 CONFIG="$(mktemp -d)/demo.json"

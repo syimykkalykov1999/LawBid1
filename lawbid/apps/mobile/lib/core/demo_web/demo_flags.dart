@@ -6,7 +6,7 @@ import 'package:lawbid/core/persistence/persistence_providers.dart';
 /// [DemoFlag] to [kDemoFlags] and reads it with
 /// `ref.watch(demoFlagProvider('id'))`. Off = the live behaviour; on = the
 /// proposal. Only the web demo shows the panel; production never reads it
-/// (the value is false unless [kDemoMode] build turned it on).
+/// (the value is false unless kDemoMode build turned it on).
 class DemoFlag {
   const DemoFlag(this.id, this.title, {this.hint = ''});
 
