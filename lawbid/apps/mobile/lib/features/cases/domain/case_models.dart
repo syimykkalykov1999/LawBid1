@@ -1,0 +1,802 @@
+import 'package:flutter/foundation.dart';
+import 'package:lawbid/features/cases/domain/case_urgency.dart';
+import 'package:lawbid_api/lawbid_api.dart'
+    show
+        BidStatus,
+        BudgetMode,
+        CaseStatus,
+        ContactIssueType,
+        ContactMethod,
+        FeeType,
+        OfferStatus,
+        PartyRole,
+        StartAvailability;
+
+export 'package:lawbid/features/cases/domain/case_urgency.dart';
+export 'package:lawbid_api/lawbid_api.dart'
+    show
+        BidStatus,
+        BudgetMode,
+        CaseStatus,
+        ContactIssueType,
+        ContactMethod,
+        FeeType,
+        OfferStatus,
+        PartyRole,
+        StartAvailability;
+
+/// docs/04 §6.1: at most 5 counter-offers per bid.
+const int kMaxNegotiationRounds = 5;
+
+/// docs/04 §4.2: a case younger than 24 hours shows NEW.
+const Duration kCaseNewBadgeAge = Duration(hours: 24);
+
+/// Practice area as the cases API returns it (leaf + its category).
+@immutable
+class PracticeRef {
+  const PracticeRef({
+    required this.id,
+    required this.code,
+    required this.i18nKey,
+    required this.nameEn,
+    this.categoryI18nKey,
+    this.categoryNameEn,
+    this.categoryCode,
+  });
+
+  final String id;
+  final String code;
+  final String i18nKey;
+  final String nameEn;
+  final String? categoryI18nKey;
+  final String? categoryNameEn;
+
+  /// The top-level category code (e.g. `family_law`) — picks the card art.
+  /// Falls back to the leaf code's first segment.
+  final String? categoryCode;
+
+  String get artCode => categoryCode ?? code.split('.').first;
+}
+
+/// docs/04 §3.2 budget: whole-case amount in cents or "Clarify later".
+@immutable
+class CaseBudget {
+  const CaseBudget({required this.mode, this.amountCents});
+
+  final BudgetMode mode;
+  final int? amountCents;
+
+  bool get isClarifyLater => mode != BudgetMode.amount || amountCents == null;
+}
+
+/// "Мои кейсы" card (docs/04 §11.1).
+@immutable
+class CaseSummary {
+  const CaseSummary({
+    required this.id,
+    required this.title,
+    required this.practice,
+    required this.primaryStateCode,
+    required this.additionalStateCount,
+    required this.city,
+    required this.status,
+    required this.budget,
+    required this.bidsCount,
+    required this.createdAt,
+    required this.lastActivityAt,
+    this.coverUrl,
+    this.coverKey,
+    this.urgency,
+    this.urgencyDetail,
+  });
+
+  /// Owner 2026-10-04: the chosen app cover (`art:N` / `icon:name`).
+  final String? coverKey;
+  final CaseUrgency? urgency;
+
+  /// Owner 2026-10-05: the level today and the date, when the API sent
+  /// them; [urgencyInfo] falls back to [urgency] alone.
+  final CaseUrgencyInfo? urgencyDetail;
+  CaseUrgencyInfo get urgencyInfo =>
+      urgencyDetail ?? CaseUrgencyInfo(choice: urgency);
+
+  /// Owner 2026-09-30: the first photo (the Mine grid) when this viewer
+  /// may see photos; else the qualification's art is shown.
+  final String? coverUrl;
+
+  final String id;
+  final String title;
+  final PracticeRef practice;
+  final String primaryStateCode;
+  final int additionalStateCount;
+  final String? city;
+  final CaseStatus status;
+  final CaseBudget budget;
+  final int bidsCount;
+  final DateTime createdAt;
+  final DateTime lastActivityAt;
+}
+
+/// The owner's full case (docs/04 §11.1) incl. "Адвокат в работе".
+@immutable
+
+/// OQ-031: a case photo — short-lived signed links.
+@immutable
+class CasePhoto {
+  const CasePhoto({
+    required this.fileId,
+    required this.url,
+    required this.previewUrl,
+    this.mime = 'image/jpeg',
+    this.sizeBytes = 0,
+  });
+
+  final String fileId;
+  final String url;
+  final String previewUrl;
+
+  /// OQ-034: photos and documents (PDF, Word) share the list.
+  final String mime;
+  final int sizeBytes;
+
+  bool get isImage => mime.startsWith('image/');
+}
+
+class OwnerCase {
+  const OwnerCase({
+    required this.id,
+    required this.title,
+    required this.description,
+    required this.practice,
+    required this.primaryStateCode,
+    required this.additionalStateCodes,
+    required this.city,
+    required this.budget,
+    required this.status,
+    required this.viewCount,
+    required this.bidsCount,
+    required this.createdAt,
+    required this.lastActivityAt,
+    this.archivedAt,
+    this.clientCompletedAt,
+    this.attorneyConfirmedAt,
+    this.autoCloseAt,
+    this.closedAt,
+    this.acceptedBid,
+    this.conversationId,
+    this.photos = const [],
+    this.stalePromptSentAt,
+    this.coverKey,
+    this.urgency,
+    this.urgencyDetail,
+  });
+
+  /// Audit 2026-10-04: when the "still relevant?" prompt went out for this
+  /// open case (null = not asked); the owner can answer on the case.
+  final DateTime? stalePromptSentAt;
+
+  /// OQ-031: the case photos (the owner always sees them).
+  final List<CasePhoto> photos;
+
+  /// Owner 2026-10-04: the chosen app cover (`art:N` / `icon:name`).
+  final String? coverKey;
+  final CaseUrgency? urgency;
+
+  /// Owner 2026-10-05: the level today and the date, when the API sent
+  /// them; [urgencyInfo] falls back to [urgency] alone.
+  final CaseUrgencyInfo? urgencyDetail;
+  CaseUrgencyInfo get urgencyInfo =>
+      urgencyDetail ?? CaseUrgencyInfo(choice: urgency);
+
+  final String id;
+  final String title;
+  final String description;
+  final PracticeRef practice;
+  final String primaryStateCode;
+  final List<String> additionalStateCodes;
+  final String? city;
+  final CaseBudget budget;
+  final CaseStatus status;
+  final int viewCount;
+  final int bidsCount;
+  final DateTime createdAt;
+  final DateTime lastActivityAt;
+  final DateTime? archivedAt;
+  final DateTime? clientCompletedAt;
+  final DateTime? attorneyConfirmedAt;
+  final DateTime? autoCloseAt;
+
+  /// Owner 2026-10-02: who marked "Done" first while the case waits for
+  /// the other side — the client's mark or the attorney's.
+  bool get attorneyMarkedDone =>
+      status == CaseStatus.pendingCompletion &&
+      attorneyConfirmedAt != null &&
+      clientCompletedAt == null;
+  bool get clientMarkedDone =>
+      status == CaseStatus.pendingCompletion &&
+      clientCompletedAt != null &&
+      attorneyConfirmedAt == null;
+  final DateTime? closedAt;
+  final CaseBid? acceptedBid;
+  final String? conversationId;
+
+  /// §3.5: practice area and states are editable only without bids.
+  bool get canChangePracticeAndStates => bidsCount == 0;
+}
+
+/// Public summary of the bidding attorney (docs/04 §5.2).
+@immutable
+class BidAttorney {
+  const BidAttorney({
+    required this.id,
+    required this.username,
+    required this.firstName,
+    required this.lastName,
+    required this.avatarUrl,
+    required this.verifiedBadge,
+    required this.ratingAvg,
+    required this.ratingCount,
+    this.licensedStates = const [],
+    this.trustLevel = 0,
+  });
+
+  /// Owner 2026-10-05: trust level 0..3 (docs/ATTORNEY_TRUST.md).
+  final int trustLevel;
+
+  /// Owner 2026-10-04: 2-letter codes of the attorney's verified licences
+  /// (shown to the client when the case's state is not among them).
+  final List<String> licensedStates;
+
+  final String id;
+  final String username;
+  final String? firstName;
+  final String? lastName;
+  final String? avatarUrl;
+  final bool verifiedBadge;
+  final double ratingAvg;
+  final int ratingCount;
+
+  String get fullName => [firstName, lastName]
+      .whereType<String>()
+      .where((s) => s.isNotEmpty)
+      .join(' ');
+}
+
+/// One step of the negotiation (docs/04 §6, `bid_offers`).
+@immutable
+class BidOffer {
+  const BidOffer({
+    required this.id,
+    required this.roundNo,
+    required this.fromRole,
+    required this.feeType,
+    required this.amountCents,
+    required this.message,
+    required this.status,
+    required this.createdAt,
+  });
+
+  final String id;
+  final int roundNo;
+  final PartyRole fromRole;
+  final FeeType feeType;
+  final int amountCents;
+  final String? message;
+  final OfferStatus status;
+  final DateTime createdAt;
+}
+
+/// A bid with its terms; [attorney] is present in the client's list,
+/// [offers] in the bid detail.
+@immutable
+class CaseBid {
+  const CaseBid({
+    required this.id,
+    required this.caseId,
+    required this.attorneyId,
+    required this.status,
+    required this.feeType,
+    required this.amountCents,
+    required this.message,
+    required this.startAvailability,
+    required this.startDate,
+    required this.estimatedDurationDays,
+    required this.roundCount,
+    required this.turn,
+    required this.createdAt,
+    this.decidedAt,
+    this.attorney,
+    this.offers = const [],
+    this.outsidePractice = false,
+    this.outsideLicensedStates = false,
+  });
+
+  /// Owner 2026-09-30: the case's practice is outside the attorney's own —
+  /// the client is told to discuss it before accepting.
+  final bool outsidePractice;
+
+  /// Owner 2026-10-04: the attorney has no verified licence in the case's
+  /// states — allowed, the client is told before accepting.
+  final bool outsideLicensedStates;
+
+  final String id;
+  final String caseId;
+  final String attorneyId;
+  final BidStatus status;
+  final FeeType feeType;
+  final int amountCents;
+  final String message;
+  final StartAvailability startAvailability;
+  final DateTime? startDate;
+  final int? estimatedDurationDays;
+  final int roundCount;
+  final PartyRole turn;
+  final DateTime createdAt;
+  final DateTime? decidedAt;
+  final BidAttorney? attorney;
+  final List<BidOffer> offers;
+
+  bool get isActive => status == BidStatus.active;
+  bool get isFreeConsultation => feeType == FeeType.freeConsultation;
+
+  /// §6.1: counters are possible below the cap and never for free
+  /// consultations.
+  bool get canCounter =>
+      isActive && !isFreeConsultation && roundCount < kMaxNegotiationRounds;
+
+  bool isTurnOf(PartyRole role) => isActive && turn == role;
+}
+
+/// Owner 2026-10-05: what the client has put into the case — counts only
+/// (the files open to the accepted attorney alone, OQ-031). Lets an
+/// attorney judge a case before bidding.
+@immutable
+class CaseDossier {
+  const CaseDossier({
+    this.imagesCount = 0,
+    this.documentsCount = 0,
+    this.descriptionLength = 0,
+  });
+
+  static const empty = CaseDossier();
+
+  final int imagesCount;
+  final int documentsCount;
+  final int descriptionLength;
+}
+
+/// Attorney feed card and detail (docs/04 §4.2, §4.3). No client field
+/// ever exists here.
+@immutable
+class FeedCase {
+  const FeedCase({
+    required this.id,
+    required this.title,
+    required this.practice,
+    required this.primaryStateCode,
+    required this.additionalStateCodes,
+    required this.city,
+    required this.status,
+    required this.budget,
+    required this.viewCount,
+    required this.bidsCount,
+    required this.createdAt,
+    required this.isNew,
+    required this.hasOwnBid,
+    this.description,
+    this.excerpt = '',
+    this.isSaved = false,
+    this.ownBidId,
+    this.photos = const [],
+    this.photosCount = 0,
+    this.commentCount = 0,
+    this.shareCount = 0,
+    this.inMyPractice = true,
+    this.inMyLicensedStates = true,
+    this.bidAllowed = true,
+    this.promoted = false,
+    this.priorityClient = false,
+    this.completionRequestedBy,
+    this.acceptedBidIsMine = false,
+    this.coverKey,
+    this.urgency,
+    this.urgencyDetail,
+    this.dossier = CaseDossier.empty,
+  });
+
+  /// Audit 2026-10-04 (detail only): this attorney's bid is the accepted
+  /// one — the case belongs on the work screen.
+  final bool acceptedBidIsMine;
+
+  /// Owner 2026-10-05: files and filled-in details (counts only).
+  final CaseDossier dossier;
+
+  /// Owner 2026-10-04: the client's cover choice (`art:N` / `icon:name`);
+  /// null = a variant picked from the id. Never the client's photo.
+  final String? coverKey;
+
+  /// Owner 2026-10-04: how soon the client needs an attorney.
+  final CaseUrgency? urgency;
+
+  /// Owner 2026-10-05: the level today and the date, when the API sent
+  /// them; [urgencyInfo] falls back to [urgency] alone.
+  final CaseUrgencyInfo? urgencyDetail;
+  CaseUrgencyInfo get urgencyInfo =>
+      urgencyDetail ?? CaseUrgencyInfo(choice: urgency);
+
+  /// Owner 2026-10-02: a paid promotion keeps this case near the top.
+  final bool promoted;
+
+  /// Owner 2026-10-05 (plan builder): the client's plan puts the case
+  /// first in the feed (shown with a small «Приоритет» mark).
+  final bool priorityClient;
+
+  /// `client` / `attorney`: who marked "Done" first (waiting for the other).
+  final String? completionRequestedBy;
+
+  /// Owner 2026-09-30: the case's practice is one of this attorney's
+  /// (detail only; a bid from outside them warns the client).
+  final bool inMyPractice;
+
+  /// Owner 2026-10-04: the attorney holds a verified licence in one of the
+  /// case's states (detail only; otherwise "Bid" notes the client sees it).
+  final bool inMyLicensedStates;
+
+  /// Owner 2026-10-04: an attorney may bid on any open case; the server
+  /// keeps this for older apps (always true).
+  final bool bidAllowed;
+
+  /// OQ-034: comments under the case.
+  final int commentCount;
+
+  /// OQ-037: completed shares.
+  final int shareCount;
+
+  final String id;
+  final String title;
+  final PracticeRef practice;
+  final String primaryStateCode;
+  final List<String> additionalStateCodes;
+  final String? city;
+  final CaseStatus status;
+  final CaseBudget budget;
+  final int viewCount;
+  final int bidsCount;
+  final DateTime createdAt;
+  final bool isNew;
+  final bool hasOwnBid;
+
+  /// OQ-031: photos — only once this attorney's bid was accepted.
+  final List<CasePhoto> photos;
+
+  /// OQ-031: how many photos the case has (every attorney sees this).
+  final int photosCount;
+  final String? description;
+
+  /// Owner 2026-09-30: short description preview for the feed card.
+  final String excerpt;
+  final bool isSaved;
+
+  /// The attorney's own bid (detail only, §4.3).
+  final String? ownBidId;
+
+  FeedCase copyWith({bool? isSaved}) => FeedCase(
+        id: id,
+        title: title,
+        practice: practice,
+        primaryStateCode: primaryStateCode,
+        additionalStateCodes: additionalStateCodes,
+        city: city,
+        status: status,
+        budget: budget,
+        viewCount: viewCount,
+        bidsCount: bidsCount,
+        createdAt: createdAt,
+        isNew: isNew,
+        hasOwnBid: hasOwnBid,
+        description: description,
+        isSaved: isSaved ?? this.isSaved,
+        ownBidId: ownBidId,
+        excerpt: excerpt,
+        photos: photos,
+        photosCount: photosCount,
+        commentCount: commentCount,
+        shareCount: shareCount,
+        inMyPractice: inMyPractice,
+        promoted: promoted,
+        priorityClient: priorityClient,
+        completionRequestedBy: completionRequestedBy,
+        coverKey: coverKey,
+        urgency: urgency,
+        urgencyDetail: urgencyDetail,
+        bidAllowed: bidAllowed,
+        acceptedBidIsMine: acceptedBidIsMine,
+        dossier: dossier,
+      );
+}
+
+/// "Мои биды" row (docs/04 §11.2).
+@immutable
+class MyBid {
+  const MyBid({
+    required this.bid,
+    required this.caseId,
+    required this.caseTitle,
+    required this.caseStatus,
+    required this.casePracticeI18nKey,
+    required this.casePracticeNameEn,
+    required this.primaryStateCode,
+    required this.lastOffer,
+    this.casePracticeCode,
+    this.coverUrl,
+  });
+
+  /// Owner 2026-09-30: the first photo (the Mine grid) when this viewer
+  /// may see photos; else the qualification's art is shown.
+  final String? coverUrl;
+
+  final CaseBid bid;
+  final String caseId;
+  final String caseTitle;
+  final CaseStatus caseStatus;
+  final String casePracticeI18nKey;
+  final String casePracticeNameEn;
+  final String primaryStateCode;
+  final BidOffer lastOffer;
+
+  /// Leaf practice code — picks the card art.
+  final String? casePracticeCode;
+}
+
+/// "В работе" / "Завершённые" row (docs/04 §11.2).
+@immutable
+class WorkItem {
+  const WorkItem({
+    required this.caseId,
+    required this.bidId,
+    required this.title,
+    required this.status,
+    required this.clientName,
+    required this.feeType,
+    required this.amountCents,
+    this.autoCloseAt,
+    this.acceptedAt,
+    this.closedAt,
+    this.primaryStateCode,
+    this.practiceCode,
+    this.practiceI18nKey,
+    this.practiceNameEn,
+    this.coverUrl,
+  });
+
+  /// Owner 2026-09-30: the first photo (the Mine grid) when this viewer
+  /// may see photos; else the qualification's art is shown.
+  final String? coverUrl;
+
+  final String caseId;
+  final String bidId;
+  final String title;
+  final CaseStatus status;
+
+  /// Null while the subscription is inactive (§8.3).
+  final String? clientName;
+  final FeeType feeType;
+  final int amountCents;
+  final DateTime? autoCloseAt;
+  final DateTime? acceptedAt;
+  final DateTime? closedAt;
+  final String? primaryStateCode;
+
+  /// Leaf practice code — picks the card art.
+  final String? practiceCode;
+  final String? practiceI18nKey;
+  final String? practiceNameEn;
+}
+
+/// "Сохранённое" row (docs/04 §11.2): an available case or "Кейс
+/// недоступен".
+@immutable
+class SavedCase {
+  const SavedCase({
+    required this.caseId,
+    required this.savedAt,
+    required this.available,
+    this.title,
+    this.card,
+  });
+
+  final String caseId;
+  final DateTime savedAt;
+  final bool available;
+  final String? title;
+  final FeedCase? card;
+}
+
+/// Client contacts after acceptance (docs/04 §8.1).
+@immutable
+class ClientContacts {
+  const ClientContacts({
+    required this.caseId,
+    required this.bidId,
+    required this.firstName,
+    required this.lastName,
+    required this.phone,
+    required this.email,
+    required this.contactMethod,
+    required this.contactNote,
+    required this.disclosedAt,
+  });
+
+  final String caseId;
+  final String bidId;
+  final String? firstName;
+  final String? lastName;
+  final String? phone;
+  final String? email;
+  final ContactMethod? contactMethod;
+  final String? contactNote;
+  final DateTime disclosedAt;
+
+  String get fullName => [firstName, lastName]
+      .whereType<String>()
+      .where((s) => s.isNotEmpty)
+      .join(' ');
+}
+
+/// docs/04 §8.4 "Не могу связаться" reasons.
+const List<ContactIssueType> kContactIssueTypes = [
+  ContactIssueType.phoneInvalid,
+  ContactIssueType.noAnswer,
+  ContactIssueType.emailBounce,
+  ContactIssueType.wrongPerson,
+  ContactIssueType.other,
+];
+
+/// The pre-acceptance / active chat of a case (docs/04 §9).
+@immutable
+class CaseConversation {
+  const CaseConversation({
+    required this.id,
+    required this.contactsUnlocked,
+  });
+
+  final String id;
+  final bool contactsUnlocked;
+}
+
+/// "История кейсов" (docs/04 §12).
+@immutable
+class HistoryCase {
+  const HistoryCase({
+    required this.id,
+    required this.title,
+    required this.practiceI18nKey,
+    required this.practiceNameEn,
+    required this.primaryStateCode,
+    required this.status,
+    required this.deleted,
+    required this.createdAt,
+    this.closedAt,
+    this.archivedAt,
+    this.acceptedAmountCents,
+    this.acceptedFeeType,
+  });
+
+  final String id;
+  final String title;
+  final String practiceI18nKey;
+  final String practiceNameEn;
+  final String primaryStateCode;
+  final CaseStatus status;
+  final bool deleted;
+  final DateTime createdAt;
+  final DateTime? closedAt;
+  final DateTime? archivedAt;
+  final int? acceptedAmountCents;
+  final FeeType? acceptedFeeType;
+}
+
+enum HistoryActor { client, attorney, admin, system }
+
+@immutable
+class HistoryEvent {
+  const HistoryEvent({
+    required this.id,
+    required this.eventType,
+    required this.createdAt,
+    required this.actor,
+    this.amountCents,
+    this.feeType,
+    this.roundNo,
+    this.reason,
+  });
+
+  final String id;
+  final String eventType;
+  final DateTime createdAt;
+  final HistoryActor actor;
+  final int? amountCents;
+  final FeeType? feeType;
+  final int? roundNo;
+  final String? reason;
+}
+
+@immutable
+class HistoryCaseDetail {
+  const HistoryCaseDetail({
+    required this.item,
+    required this.clientName,
+    required this.events,
+  });
+
+  final HistoryCase item;
+
+  /// Null → "Client" (docs/04 §12, attorney without disclosed contacts).
+  final String? clientName;
+  final List<HistoryEvent> events;
+}
+
+enum HistoryExportStatus { queued, ready, failed }
+
+@immutable
+class HistoryExport {
+  const HistoryExport({
+    required this.exportId,
+    required this.status,
+    this.url,
+    this.expiresAt,
+  });
+
+  final String exportId;
+  final HistoryExportStatus status;
+  final String? url;
+  final DateTime? expiresAt;
+}
+
+/// Filters of "Мои кейсы" (docs/04 §11.1).
+/// Owner 2026-09-30: `open` and `inProgress` are the Mine tabs; `active`
+/// (both) stays for the profile grid and search.
+enum MyCasesFilter { active, open, inProgress, archived, closed }
+
+/// Owner 2026-09-30: search and filters of the "Mine" lists.
+@immutable
+class MineSearch {
+  const MineSearch({this.q = '', this.practice, this.state});
+
+  final String q;
+  final String? practice;
+  final String? state;
+
+  bool get isEmpty => q.trim().isEmpty && practice == null && state == null;
+
+  /// How many filters (not the text) are on — the filter button's badge.
+  int get filterCount => (practice == null ? 0 : 1) + (state == null ? 0 : 1);
+
+  MineSearch copyWith({
+    String? q,
+    String? Function()? practice,
+    String? Function()? state,
+  }) =>
+      MineSearch(
+        q: q ?? this.q,
+        practice: practice == null ? this.practice : practice(),
+        state: state == null ? this.state : state(),
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is MineSearch &&
+      other.q == q &&
+      other.practice == practice &&
+      other.state == state;
+
+  @override
+  int get hashCode => Object.hash(q, practice, state);
+}
+
+/// Sort of a case's bid list (docs/04 §5.2).
+enum BidsSort { newest, lowestPrice, highestRating }
+
+enum MyBidsFilter { active, finished }
+
+enum WorkFilter { active, closed }

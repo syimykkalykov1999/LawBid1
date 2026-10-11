@@ -1,0 +1,253 @@
+import 'package:flutter/foundation.dart';
+import 'package:lawbid/core/navigation/app_routes.dart';
+import 'package:lawbid/core/startup/app_startup.dart';
+import 'package:lawbid/features/auth/auth_routes.dart';
+import 'package:lawbid/features/onboarding/application/current_user_controller.dart';
+import 'package:lawbid/features/onboarding/domain/current_user.dart';
+import 'package:lawbid/features/onboarding/domain/onboarding_step_id.dart';
+import 'package:lawbid/features/onboarding/onboarding_routes.dart';
+import 'package:lawbid/features/profile/domain/verification_gate.dart';
+import 'package:lawbid/shared/domain/user_role.dart';
+
+/// OQ-048: where an assistant stands — still loading, joined an
+/// attorney, or not (→ the join screen).
+enum AssistantGate { notAssistant, loading, active, notJoined }
+
+/// Routes an assistant never uses (the attorney's billing / verification).
+const _assistantBlocked = [
+  '/profile/settings/subscription',
+  '/verification',
+  '/trust/me',
+];
+const _assistantJoin = '/assistant/join';
+
+/// Everything the guard decides on — a plain value so the redirect table
+/// is unit-testable without a router or providers
+/// (test/core/navigation/app_router_guard_test.dart).
+@immutable
+class GuardSnapshot {
+  const GuardSnapshot({
+    required this.startup,
+    required this.hasSession,
+    required this.user,
+    this.assistant = AssistantGate.notAssistant,
+  });
+
+  final StartupStatus startup;
+
+  /// OQ-048: an assistant's team state (`GET /assistants/me`).
+  final AssistantGate assistant;
+
+  /// A token-backed session exists (SessionController state non-null).
+  final bool hasSession;
+
+  /// `GET /users/me` state (CurrentUserController).
+  final CurrentUserState user;
+}
+
+/// The ONLY place navigation redirects are decided (`.cursorrules`:
+/// "Гейты навигации только в AppRouterGuard"; docs/01_FOUNDATION_AUTH.md
+/// §11 "Guard-логика навигации"):
+///
+/// ```text
+/// нет токена                      → /welcome
+/// токен есть, нет согласий/18+    → /onboarding/consents
+/// нет роли                        → /onboarding/role
+/// клиент без подтверждённых
+/// телефона И email                → /onboarding/contacts (нельзя пропустить)
+/// адвокат без подтверждённого
+/// телефона                        → /onboarding/contacts
+/// онбординг не завершён           → /onboarding/{текущий шаг}
+/// всё готово, но есть непринятые
+/// юридические документы           → /legal-accept (Owner 2026-10-05)
+/// attorney + unverified           → главное меню доступно, «Кейсы» (Моё)
+///                                   показывает экран верификации
+/// attorney не verified + «+»      → /create/verification-required
+///                                   (docs/03 §6.4, «Пост в ленту»)
+/// клиент/адвокат ok               → /feed
+/// ```
+///
+/// Decisions come from the server's `missing` list + `onboarding.
+/// currentStep` (so closing the app mid-onboarding resumes at the saved
+/// step, §15 item 4). The language is chosen on the welcome screen's globe
+/// icon, not as an onboarding step (owner decision, docs/OPEN_QUESTIONS.md
+/// OQ-006). Refinement of the table:
+/// - Going BACK to an earlier onboarding step (§11: "кнопка «Назад»
+///   везде") is allowed; skipping FORWARD past the required step never is.
+abstract final class AppRouterGuard {
+  /// Routes usable without a session.
+  static const publicAuthRoutes = {
+    AuthRoutes.welcome,
+    AuthRoutes.phone,
+    AuthRoutes.email,
+    AuthRoutes.otp,
+    AuthRoutes.assistant,
+  };
+
+  static String? redirect(String location, GuardSnapshot s) {
+    final isLegal = location.startsWith(AppRoutes.legalPrefix);
+
+    // Splash sequence (§10.2 A) must finish before anything else.
+    if (s.startup != StartupStatus.ready) {
+      return location == AppRoutes.splash ? null : AppRoutes.splash;
+    }
+
+    // Row 1: no token → /welcome.
+    if (!s.hasSession) {
+      if (isLegal || publicAuthRoutes.contains(location)) return null;
+      return AuthRoutes.welcome;
+    }
+
+    final user = s.user.user;
+    if (user == null) {
+      // Just signed in, me is loading: stay on the sign-in screen that is
+      // finishing (no splash flicker). Otherwise the splash shows loading/
+      // error/offline for `GET /users/me`.
+      if (s.user.status == CurrentUserStatus.loading &&
+          (publicAuthRoutes.contains(location) || isLegal)) {
+        return null;
+      }
+      return location == AppRoutes.splash ? null : AppRoutes.splash;
+    }
+
+    if (isLegal) return null;
+
+    final required = requiredStep(user);
+    if (required == null) {
+      // Owner 2026-10-05 (legal documents): a new or materially changed
+      // document of the user's role is not accepted yet — the acceptance
+      // screen is the only place to be (reading a document stays possible,
+      // /legal/* returned above). The API blocks nothing else except
+      // publishing a case and placing a bid.
+      if (user.pendingLegalDocuments.isNotEmpty) {
+        return location == AppRoutes.legalAccept ? null : AppRoutes.legalAccept;
+      }
+      if (location == AppRoutes.legalAccept) return AppRoutes.feed;
+      // Rows 7-8: fully onboarded. Auth/onboarding/splash → feed; every
+      // app route (incl. the verification screens) stays reachable.
+      final onEntryRoute = location == AppRoutes.splash ||
+          publicAuthRoutes.contains(location) ||
+          OnboardingRoutes.stepOf(location) != null;
+      // OQ-048: an assistant works only inside an attorney's account.
+      if (user.role == UserRole.assistant) {
+        switch (s.assistant) {
+          case AssistantGate.loading:
+            return location == AppRoutes.splash ? null : AppRoutes.splash;
+          case AssistantGate.notJoined:
+            return location == _assistantJoin ? null : _assistantJoin;
+          case AssistantGate.active:
+          case AssistantGate.notAssistant:
+            if (location == _assistantJoin) return AppRoutes.feed;
+            if (_assistantBlocked.any(location.startsWith)) {
+              return AppRoutes.feed;
+            }
+        }
+      }
+      if (onEntryRoute) return AppRoutes.feed;
+      // docs/03 §6.4 (stage 3.9): "+" is "Post to feed" for attorneys;
+      // before verification it opens the "Complete verification" gate.
+      if (location == AppRoutes.create && attorneyNeedsVerification(user)) {
+        return AppRoutes.verificationRequired;
+      }
+      // docs/04 §11: role-specific case screens. The server refuses the
+      // other role anyway; this keeps the user out of a dead-end error.
+      final clientOnly = location.startsWith('/mine/case/');
+      final attorneyOnly = location.startsWith('/mine/work') ||
+          location == AppRoutes.completedWork ||
+          RegExp(r'^/case/[^/]+/bid$').hasMatch(location);
+      if ((clientOnly && user.role != UserRole.client) ||
+          (attorneyOnly &&
+              user.role != UserRole.attorney &&
+              user.role != UserRole.assistant)) {
+        return AppRoutes.mine;
+      }
+      return null;
+    }
+
+    final target = OnboardingRoutes.forStep(required);
+    if (location == target) return null;
+    if (_canRevisit(location, required, user)) return null;
+    return target;
+  }
+
+  /// Where a successful onboarding action moves the user: the step the
+  /// server state now requires, or the feed when onboarding is done. The
+  /// revisit rule below lets a user go BACK to a saved step, so a step's
+  /// primary button must move forward explicitly (owner bug report
+  /// 2026-09-27: consents/role "Continue" stayed on the same screen).
+  static String forwardRoute(CurrentUser user) {
+    final step = requiredStep(user);
+    return step == null ? AppRoutes.feed : OnboardingRoutes.forStep(step);
+  }
+
+  /// Rows 2-6: the onboarding step the user must be on, or null when
+  /// onboarding is complete and nothing is missing.
+  static OnboardingStepId? requiredStep(CurrentUser user) {
+    final missing = user.missing;
+    final completed = user.onboarding.isCompleted;
+    final saved = user.onboarding.currentStep;
+
+    if (missing.contains(MissingRequirement.consents)) {
+      return OnboardingStepId.consents;
+    }
+    if (missing.contains(MissingRequirement.role) || user.role == null) {
+      return OnboardingStepId.role;
+    }
+    if (user.isClient &&
+        (missing.contains(MissingRequirement.phoneVerified) ||
+            missing.contains(MissingRequirement.emailVerified))) {
+      return OnboardingStepId.contacts;
+    }
+    if (user.isAttorney && missing.contains(MissingRequirement.phoneVerified)) {
+      return OnboardingStepId.contacts;
+    }
+    if (completed) return null;
+
+    final order = OnboardingStepId.orderFor(user.role);
+    final roleIndex = order.indexOf(OnboardingStepId.role);
+    OnboardingStepId effective;
+    // The first step after the role (contacts; profile for an assistant).
+    final afterRole = order[roleIndex + 1];
+    if (saved == null) {
+      effective = afterRole;
+    } else if (!order.contains(saved)) {
+      // A step that doesn't exist for this role (e.g. `verification` saved
+      // for a client) → the last step.
+      effective = order.last;
+    } else if (order.indexOf(saved) <= roleIndex) {
+      // language/consents/role are already satisfied (rows 2-3 passed).
+      effective = afterRole;
+    } else {
+      effective = saved;
+    }
+    // The name, state / licensed states and the attorney photo are
+    // collected on the profile step — never let the user sit past it
+    // without them (the server would refuse to complete anyway).
+    if ((missing.contains(MissingRequirement.name) ||
+            missing.contains(MissingRequirement.profile) ||
+            missing.contains(MissingRequirement.photo)) &&
+        order.indexOf(effective) > order.indexOf(OnboardingStepId.profile)) {
+      effective = OnboardingStepId.profile;
+    }
+    return effective;
+  }
+
+  static bool _canRevisit(
+    String location,
+    OnboardingStepId required,
+    CurrentUser user,
+  ) {
+    if (location == AppRoutes.verification ||
+        location == AppRoutes.verificationWizard) {
+      return required == OnboardingStepId.verification;
+    }
+    // Owner 2026-10-04: practice areas and the subscription offer are
+    // stages shown in place on the verification step (no pushed screens
+    // to come back from), so nothing else is reachable mid-onboarding.
+    final step = OnboardingRoutes.stepOf(location);
+    if (step == null) return false;
+    final order = OnboardingStepId.orderFor(user.role);
+    final index = order.indexOf(step);
+    return index >= 0 && index < order.indexOf(required);
+  }
+}

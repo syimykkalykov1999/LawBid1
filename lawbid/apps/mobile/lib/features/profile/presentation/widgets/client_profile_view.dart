@@ -1,0 +1,386 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import 'package:lawbid/core/config/app_environment.dart';
+import 'package:lawbid/core/design_system/design_system.dart';
+import 'package:lawbid/core/l10n/api_error_text.dart';
+import 'package:lawbid/core/l10n/l10n_providers.dart';
+import 'package:lawbid/core/l10n/translator.dart';
+import 'package:lawbid/core/navigation/app_routes.dart';
+import 'package:lawbid/features/cases/presentation/widgets/client_cases_grid.dart';
+import 'package:lawbid/features/onboarding/application/current_user_controller.dart';
+import 'package:lawbid/features/profile/application/profile_providers.dart';
+import 'package:lawbid/features/profile/domain/profile_models.dart';
+import 'package:lawbid/features/profile/presentation/widgets/client_social_profile.dart';
+import 'package:lawbid/features/profile/presentation/widgets/profile_avatar.dart';
+
+/// The client's private profile (docs/03 §5): photo, name, state — no
+/// follower counters — and the "My cases" tab: a lock + "Visible only to
+/// you" and, until file 04 brings cases, the empty state "You have no
+/// cases yet". Nobody else can open this profile (the API answers 404).
+class ClientProfileView extends ConsumerWidget {
+  const ClientProfileView({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ref.watch(translatorProvider);
+    final profile = ref.watch(clientProfileProvider);
+    void retry() => ref.invalidate(clientProfileProvider);
+
+    return AnimatedSwitcher(
+      duration: context.reduceMotion ? Duration.zero : AppMotion.stateChange,
+      child: profile.when(
+        skipLoadingOnReload: true,
+        loading: () => const _ClientSkeleton(key: ValueKey('loading')),
+        error: (error, _) => isOfflineError(error)
+            ? AppOfflineState(
+                key: const ValueKey('offline'),
+                title: t.t('offline.title'),
+                message: t.t('offline.message'),
+                action: AppButton(
+                  label: t.t('error.retry'),
+                  icon: AppIcons.refreshRounded,
+                  variant: AppButtonVariant.secondary,
+                  height: AppSizes.touchTarget,
+                  onPressed: retry,
+                ),
+              )
+            : AppErrorState(
+                key: const ValueKey('error'),
+                message: t.t('profile.error'),
+                retryLabel: t.t('error.retry'),
+                onRetry: retry,
+              ),
+        // OQ-038: the same Instagram-like profile others see (+ Edit);
+        // the client's cases live in "Mine". The social profile has its
+        // own pull-to-refresh (it reloads this provider too).
+        data: (p) => p.username.isNotEmpty
+            ? _OwnSocial(
+                key: const ValueKey('data'),
+                username: p.username,
+              )
+            : RefreshIndicator(
+                key: const ValueKey('data'),
+                color: Theme.of(context).extension<AppColorTokens>()!.gold,
+                onRefresh: () async {
+                  ref.invalidate(clientProfileProvider);
+                  try {
+                    await ref.read(clientProfileProvider.future);
+                  } catch (_) {
+                    // Rendered by the error state.
+                  }
+                },
+                child: _ClientBody(profile: p, t: t),
+              ),
+      ),
+    );
+  }
+}
+
+class _OwnSocial extends ConsumerWidget {
+  const _OwnSocial({required this.username, super.key});
+
+  final String username;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final value = ref.watch(publicClientProfileProvider(username));
+    return value.when(
+      skipLoadingOnReload: true,
+      loading: () => const _ClientSkeleton(),
+      error: (_, __) => AppErrorState(
+        message: ref.read(translatorProvider).t('profile.error'),
+        retryLabel: ref.read(translatorProvider).t('error.retry'),
+        onRetry: () => ref.invalidate(publicClientProfileProvider(username)),
+      ),
+      data: (p) => ClientSocialProfile(
+        profile: p,
+        onRefresh: () async {
+          ref
+            ..invalidate(publicClientProfileProvider(username))
+            ..invalidate(clientProfileProvider);
+          try {
+            await ref.read(publicClientProfileProvider(username).future);
+          } catch (_) {}
+        },
+      ),
+    );
+  }
+}
+
+class _ClientBody extends ConsumerWidget {
+  const _ClientBody({required this.profile, required this.t});
+
+  final ClientProfileDetails profile;
+  final Translator t;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final typography = Theme.of(context).extension<AppTypographyTokens>()!;
+    final avatarUrl = ref
+        .watch(currentUserControllerProvider.select((s) => s.user?.avatarUrl));
+    final showReviewEntry = !ref.watch(appEnvironmentProvider).isProd;
+    final name = profile.fullName;
+
+    final children = <Widget>[
+      // Owner 2026-09-29: Instagram-like header, same as the attorney's —
+      // avatar left, name and state beside it, no card frame.
+      Row(
+        children: [
+          ProfileAvatar(
+            size: 88,
+            url: avatarUrl,
+            initials: initialsOf(
+              profile.firstName,
+              profile.lastName,
+              fallback: profile.username,
+            ),
+            semanticLabel: t.t('profile.avatar.label'),
+            viewerCloseLabel: t.t('common.close'),
+          ),
+          const SizedBox(width: AppSpacing.lg),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Semantics(
+                  header: true,
+                  child: Text(
+                    name.isEmpty ? t.t('profile.client.noName') : name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: typography.body.copyWith(
+                      color: colors.text,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: AppSpacing.xs),
+                Row(
+                  children: [
+                    AppIcon(
+                      AppIcons.locationOnOutlined,
+                      size: AppSpacing.lg,
+                      color: colors.goldStroke,
+                    ),
+                    const SizedBox(width: AppSpacing.xs),
+                    Flexible(
+                      child: Text(
+                        profile.state.name,
+                        style: typography.bodySmall
+                            .copyWith(color: colors.textSecondary),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      AppButton(
+        label: t.t('profile.action.edit'),
+        icon: AppIcons.editOutlined,
+        variant: AppButtonVariant.secondary,
+        height: AppSizes.touchTarget,
+        onPressed: () => context.push(AppRoutes.profileEdit),
+      ),
+      Row(
+        children: [
+          AppIcon(
+            AppIcons.folderOutlined,
+            size: AppSizes.iconSm,
+            color: colors.text,
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          Expanded(
+            child: Semantics(
+              header: true,
+              child: Text(
+                t.t('profile.client.myCases'),
+                style: typography.roleTitle.copyWith(color: colors.text),
+              ),
+            ),
+          ),
+          // Natural width, capped: a long "Visible only to you" can't push
+          // the title out.
+          AppTrailingCap(
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.sm,
+                vertical: AppSpacing.xs,
+              ),
+              decoration: BoxDecoration(
+                color: colors.goldTint,
+                borderRadius: BorderRadius.circular(AppRadii.pill),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  AppIcon(
+                    AppIcons.lockOutlineRounded,
+                    size: AppSpacing.md + 2,
+                    color: colors.text,
+                  ),
+                  const SizedBox(width: AppSpacing.xs),
+                  Flexible(
+                    child: Text(
+                      t.t('profile.client.onlyYou'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: typography.badge.copyWith(color: colors.text),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+      // docs/04 §11.3: the client's cases as a locked grid; the card
+      // below stays as the empty state.
+      ClientCasesGrid(
+        empty: AppCard(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.lg),
+            child: Column(
+              children: [
+                const AppIconMedallion(
+                  icon: AppIcons.lockOutlineRounded,
+                  size: AppSizes.stateMedallion - AppSpacing.xl,
+                  iconSize: AppSizes.iconLg,
+                ),
+                const SizedBox(height: AppSpacing.md),
+                Text(
+                  t.t('profile.client.noCases'),
+                  textAlign: TextAlign.center,
+                  style: typography.roleTitle.copyWith(color: colors.text),
+                ),
+                const SizedBox(height: AppSpacing.xs),
+                Text(
+                  t.t('profile.client.noCases.body'),
+                  textAlign: TextAlign.center,
+                  style: typography.body.copyWith(color: colors.textSecondary),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      // Placeholder entry to the review form until file 04 lists closed
+      // cases (non-production builds only).
+      // TODO(docs-04-closed-cases): replace with the "Leave a review"
+      // action on each closed case card.
+      if (showReviewEntry)
+        AppListRow(
+          icon: AppIcons.rateReviewOutlined,
+          label: t.t('reviews.placeholder.entry'),
+          onTap: () => _openReviewPlaceholder(context, t),
+        ),
+    ];
+
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(
+        AppSpacing.screenSide,
+        AppSpacing.sm,
+        AppSpacing.screenSide,
+        AppSpacing.xxl,
+      ),
+      children: [
+        for (var i = 0; i < children.length; i++) ...[
+          if (i > 0) const SizedBox(height: AppSpacing.lg),
+          AppEntrance(index: i, child: children[i]),
+        ],
+      ],
+    );
+  }
+
+  Future<void> _openReviewPlaceholder(
+    BuildContext context,
+    Translator t,
+  ) async {
+    final controller = TextEditingController();
+    final caseId = await showAppBottomSheet<String>(
+      context: context,
+      // The keyboard opens under the field: the sheet grows above it and
+      // scrolls instead of overflowing.
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        final colors = Theme.of(sheetContext).extension<AppColorTokens>()!;
+        final typography =
+            Theme.of(sheetContext).extension<AppTypographyTokens>()!;
+        return Padding(
+          padding: EdgeInsets.fromLTRB(
+            AppSpacing.screenSide,
+            AppSpacing.md,
+            AppSpacing.screenSide,
+            AppSpacing.lg + MediaQuery.viewInsetsOf(sheetContext).bottom,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const AppSheetHandle(),
+                Text(
+                  t.t('reviews.placeholder.entry'),
+                  style: typography.titleMedium.copyWith(color: colors.text),
+                ),
+                const SizedBox(height: AppSpacing.sm),
+                Text(
+                  t.t('reviews.placeholder.body'),
+                  style: typography.body.copyWith(color: colors.textSecondary),
+                ),
+                const SizedBox(height: AppSpacing.lg),
+                AppTextField(
+                  controller: controller,
+                  label: t.t('reviews.placeholder.caseId'),
+                  autofocus: true,
+                ),
+                const SizedBox(height: AppSpacing.lg),
+                AppButton(
+                  label: t.t('common.confirm'),
+                  height: AppSizes.touchTarget,
+                  onPressed: () =>
+                      Navigator.of(sheetContext).pop(controller.text.trim()),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    controller.dispose();
+    if (caseId != null && caseId.isNotEmpty && context.mounted) {
+      await context.push(AppRoutes.reviewFormFor(caseId));
+    }
+  }
+}
+
+class _ClientSkeleton extends StatelessWidget {
+  const _ClientSkeleton({super.key});
+
+  @override
+  Widget build(BuildContext context) => ListView(
+        physics: const NeverScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(
+          AppSpacing.screenSide,
+          AppSpacing.sm,
+          AppSpacing.screenSide,
+          AppSpacing.xxl,
+        ),
+        children: const [
+          AppSkeletonCard(),
+          SizedBox(height: AppSpacing.lg),
+          AppSkeleton(
+            height: AppSizes.touchTarget,
+            borderRadius: AppRadii.button,
+          ),
+          SizedBox(height: AppSpacing.lg),
+          AppSkeleton(height: 160, borderRadius: AppRadii.card),
+        ],
+      );
+}

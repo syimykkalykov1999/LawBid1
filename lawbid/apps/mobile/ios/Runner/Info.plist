@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<!-- Per flavor (p12 leaf-1.4): "LawBid Dev" / "LawBid Staging" /
+	     "LawBid" — the Runner target's APP_DISPLAY_NAME build setting of
+	     each Debug/Profile/Release-<flavor> configuration. -->
+	<key>CFBundleDisplayName</key>
+	<string>$(APP_DISPLAY_NAME)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(APP_DISPLAY_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<!-- Store release 2026-10-06: the app uses only HTTPS/TLS from the OS
+	     (exempt encryption), so App Store Connect stops asking the export
+	     compliance question on every upload. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<!-- LOCAL DEV ONLY (2026-09-23, docs/CHANGELOG.md): the backend runs
+	     over plain http:// during local development (no TLS cert for a
+	     LAN IP / localhost / 10.0.2.2), which iOS's App Transport Security
+	     blocks by default, so every request silently fails as a network
+	     error before it leaves the device. The prod flavor never ships it:
+	     the Runner build phase "Strip dev-only ATS (prod)" deletes this
+	     dictionary from every *-prod bundle (store release 2026-10-06). -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<!-- Biometric reauth (Phase 4 of the auth networking work,
+	     docs/CHANGELOG.md): local_auth requires this string whenever
+	     Face ID is used on iOS, or the OS silently refuses the
+	     authenticate() call. -->
+	<!-- Camera / photo library: profile photo (docs/03 §4.1, stage 3.9) and
+	     verification documents + selfie (stage 3.8). Localized in
+	     en.lproj / ru.lproj InfoPlist.strings (keys permission.camera.ios /
+	     permission.photos.ios). -->
+	<key>NSCameraUsageDescription</key>
+	<string>LawBid uses the camera to take your profile photo, photograph your license and ID document, take a verification selfie, record reels and for video calls in the app.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>LawBid uses the microphone to record voice messages and for calls in the app.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>LawBid uses your photo library so you can choose a profile photo, add photos and videos to posts, cases and chats, and upload license and ID document images.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>LawBid uses Face ID to confirm it's you before deleting your account or other sensitive actions.</string>
+	<!-- Google Sign-In (Phase 3 of the auth networking work,
+	     docs/CHANGELOG.md): iOS needs the app's REVERSED client ID
+	     registered as a URL scheme so Google's OAuth redirect can get back
+	     into the app. The value is the build setting
+	     GOOGLE_REVERSED_CLIENT_ID: set it in the gitignored
+	     ios/Flutter/Secrets.xcconfig (copy Secrets.example.xcconfig; see
+	     docs/KEYS_SETUP.md). Debug/Release.xcconfig give it a harmless
+	     "not configured" default so the app builds without it. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(GOOGLE_REVERSED_CLIENT_ID)</string>
+			</array>
+		</dict>
+		<!-- LawBid deep links (p12 leaf-1.4, docs/01_FOUNDATION_AUTH.md
+		     §10.2 E/F, §12): lawbid://auth/email-code?email=…&code=… (magic
+		     sign-in link) and lawbid://case/<id> etc. Universal links on
+		     https://$(DEEP_LINK_HOST) come through the Associated Domains
+		     entitlement (Runner/Runner.entitlements). -->
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>app.lawbid.deeplink</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>lawbid</string>
+			</array>
+		</dict>
+	</array>
+	<!-- Links are handled by app_links + DeepLinkController
+	     (lib/core/deeplinks) so a magic link can verify its code; Flutter's
+	     built-in router deep linking would only push the raw path. -->
+	<key>FlutterDeepLinkingEnabled</key>
+	<false/>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>flutter</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+					<key>UISceneStoryboardFile</key>
+					<string>Main</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+</dict>
+</plist>

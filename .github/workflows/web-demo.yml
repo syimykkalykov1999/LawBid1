@@ -1,0 +1,52 @@
+name: Web demo
+
+# Собирает веб-версию приложения в демо-режиме (без сервера) и выкладывает на GitHub Pages:
+# https://syimykkalykov1999.github.io/LawBid1/
+# Один раз в настройках репозитория: Settings → Pages → Source: GitHub Actions.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lawbid/apps/mobile/**'
+      - 'lawbid/packages/api-contract/dart/**'
+      - '.github/workflows/web-demo.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lawbid/apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter --version
+      - name: Build web (demo mode)
+        run: tool/web_preview/build_demo.sh build/web_demo /LawBid1/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: lawbid/apps/mobile/build/web_demo
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
