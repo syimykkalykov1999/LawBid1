@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:lawbid/core/demo_web/demo_flags.dart';
+import 'package:lawbid/core/demo_web/demo_http_adapter.dart';
 import 'package:lawbid/core/design_system/design_system.dart';
 import 'package:lawbid/core/l10n/l10n_providers.dart';
 import 'package:lawbid/features/demo/application/demo_providers.dart';
@@ -78,11 +80,17 @@ class _Banner extends ConsumerWidget {
               const SizedBox(width: AppSpacing.sm),
               // The text yields; the two buttons keep their place.
               Flexible(
-                child: Text(
-                  t.t('demo.banner'),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: type.caption.copyWith(color: colors.bg),
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: kDemoMode ? () => showDemoFlagsSheet(context) : null,
+                  child: Text(
+                    kDemoMode
+                        ? '${t.t('demo.banner')} · настройки'
+                        : t.t('demo.banner'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: type.caption.copyWith(color: colors.bg),
+                  ),
                 ),
               ),
               const SizedBox(width: AppSpacing.xs),
