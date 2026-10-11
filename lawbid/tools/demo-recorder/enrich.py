@@ -229,5 +229,33 @@ for pth, v in o['paths'].items():
         pass
 D['kinds'] = kinds
 
+# valid-shaped answers for writes (POST/PATCH/PUT/DELETE): required fields only
+def sample(sc, depth=0):
+    sc = rschema(sc)
+    if depth > 5: return None
+    if 'enum' in sc: return sc['enum'][0]
+    t = sc.get('type')
+    if 'properties' in sc or t == 'object':
+        req = sc.get('required') or []
+        return {k: sample(v, depth + 1) for k, v in sc.get('properties', {}).items() if k in req}
+    if t == 'array': return []
+    if t == 'boolean': return True
+    if t in ('integer', 'number'): return 0
+    if t == 'string':
+        return '2026-10-11T18:00:00.000Z' if sc.get('format') == 'date-time' else 'demo'
+    return None
+writes = {}
+for pth, v in o['paths'].items():
+    for meth in ('post', 'patch', 'put', 'delete'):
+        g = v.get(meth)
+        if not g: continue
+        r = next((x for k, x in g['responses'].items() if k.startswith('2')), None)
+        try:
+            sc = r['content']['application/json']['schema']
+            writes[f'{meth.upper()} {pth}'] = sample(sc)
+        except Exception:
+            pass
+D['writes'] = writes
+
 json.dump(D, open(path, 'w'), ensure_ascii=False, separators=(',', ':'))
 print('donor-filled', filled, 'size', os.path.getsize(path))

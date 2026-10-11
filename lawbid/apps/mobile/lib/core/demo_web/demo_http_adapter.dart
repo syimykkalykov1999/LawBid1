@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:lawbid/core/demo_web/demo_accounts.dart';
 
 /// Build-time switch for the server-less demo: `--dart-define=DEMO_MODE=true`.
 /// In that build every API call is answered from `assets/demo/api.json`
@@ -57,10 +58,13 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
     final method = options.method.toUpperCase();
     final body = await _readBody(requestStream);
 
+    final mine = await _accountRoute(method, path, body);
+    if (mine != null) return _ok(mine);
+
     final auth = _auth(method, path, body);
     if (auth != null) return _ok(auth);
 
-    if (method != 'GET') return _ok(_write(method, path));
+    if (method != 'GET') return _ok(_write(data, method, path));
 
     final i18n = await _i18n(path, options.uri.queryParameters);
     if (i18n != null) return _ok(i18n);
@@ -186,6 +190,62 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
     return null;
   }
 
+  /// Sign-in and the account routes of numbers that registered in this
+  /// browser (see [DemoAccounts]); null for everything else.
+  static Future<Object?> _accountRoute(
+    String method,
+    String path,
+    String body,
+  ) async {
+    Map<String, dynamic> json() {
+      try {
+        return jsonDecode(body) as Map<String, dynamic>;
+      } catch (_) {
+        return const <String, dynamic>{};
+      }
+    }
+
+    if (method == 'POST' && path == '/auth/otp/verify') {
+      final id = (json()['identifier'] as String?) ?? '';
+      final acct = await DemoAccounts.signIn(id);
+      if (acct == null) return null; // a ready-made account: _auth answers
+      final role = DemoAccounts.roleOf(acct);
+      if (role == 'client' || role == 'attorney') _role = role!;
+      return {
+        'data': _tokens(
+          sub: acct['id'] as String,
+          role: role,
+          refresh: 'demo-refresh-${acct['id']}',
+          isNewUser: acct['isNew'] == true,
+        ),
+      };
+    }
+    if (method == 'POST' && path == '/auth/refresh') {
+      final token = (json()['refreshToken'] as String?) ?? '';
+      const prefix = 'demo-refresh-';
+      if (token.startsWith(prefix)) {
+        final sub = token.substring(prefix.length);
+        if (DemoAccounts.isCreated(sub)) {
+          final acct = await DemoAccounts.select(sub);
+          if (acct != null) {
+            final role = DemoAccounts.roleOf(acct);
+            if (role == 'client' || role == 'attorney') _role = role!;
+            return {
+              'data': _tokens(sub: sub, role: role, refresh: token),
+            };
+          }
+        }
+      }
+      await DemoAccounts.select('');
+      return null;
+    }
+    if (method == 'POST' && path == '/demo/invites/redeem') {
+      await DemoAccounts.select('');
+      return null;
+    }
+    return DemoAccounts.handle(method, path, json());
+  }
+
   static Future<String> _readBody(Stream<Uint8List>? stream) async {
     if (stream == null) return '';
     final bytes = <int>[];
@@ -222,7 +282,7 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
         final id = (json()['identifier'] as String?) ?? '';
         final last = int.tryParse(id.isEmpty ? '0' : id[id.length - 1]) ?? 0;
         _role = last.isOdd ? 'client' : 'attorney';
-        return {'data': _tokens(_role, isNewUser: false)};
+        return {'data': _tokensFor(_role)};
       case '/demo/invites/redeem':
         final code = ((json()['code'] as String?) ?? '').toUpperCase();
         _role = code.startsWith('B') ? 'client' : 'attorney';
@@ -236,7 +296,7 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
               'lastSeenAt': '2026-10-11T00:00:00.000Z',
               'expiresAt': '2099-01-01T00:00:00.000Z',
             },
-            'tokens': _tokens(_role),
+            'tokens': _tokensFor(_role),
           },
         };
       case '/auth/refresh':
@@ -244,19 +304,24 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
         if (token.startsWith('demo-refresh-')) {
           _role = token.substring('demo-refresh-'.length);
         }
-        return {'data': _tokens(_role)};
+        return {'data': _tokensFor(_role)};
     }
     return null;
   }
 
-  static Map<String, dynamic> _tokens(String role, {bool isNewUser = false}) {
+  static Map<String, dynamic> _tokens({
+    required String sub,
+    required String? role,
+    required String refresh,
+    bool isNewUser = false,
+  }) {
     String b64(Object o) =>
         base64Url.encode(utf8.encode(jsonEncode(o))).replaceAll('=', '');
     final exp = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 900;
     final jwt = [
       b64({'alg': 'none', 'typ': 'JWT'}),
       b64({
-        'sub': 'demo-$role',
+        'sub': sub,
         'role': role,
         'sid': 'demo-session',
         'verified': true,
@@ -269,15 +334,42 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
     ].join('.');
     return {
       'accessToken': jwt,
-      'refreshToken': 'demo-refresh-$role',
+      'refreshToken': refresh,
       'accessTokenExpiresIn': 900,
       'isNewUser': isNewUser,
     };
   }
 
-  static Object _write(String method, String path) => {
-        'data': <String, dynamic>{},
-      };
+  static Map<String, dynamic> _tokensFor(String role,
+          {bool isNewUser = false}) =>
+      _tokens(
+        sub: 'demo-$role',
+        role: role,
+        refresh: 'demo-refresh-$role',
+        isNewUser: isNewUser,
+      );
+
+  /// The answer the API contract promises for a write (written by
+  /// enrich.py); an empty envelope when the route is unknown.
+  static Object _write(Map<String, dynamic> data, String method, String path) {
+    final writes = data['writes'] as Map<String, dynamic>? ?? const {};
+    final parts = path.split('/');
+    for (final entry in writes.entries) {
+      final space = entry.key.indexOf(' ');
+      if (entry.key.substring(0, space) != method) continue;
+      final pattern = entry.key.substring(space + 1).split('/');
+      if (pattern.length != parts.length) continue;
+      var ok = true;
+      for (var i = 0; i < parts.length; i++) {
+        if (!pattern[i].startsWith('{') && pattern[i] != parts[i]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok && entry.value != null) return entry.value as Object;
+    }
+    return <String, dynamic>{'data': <String, dynamic>{}};
+  }
 
   static ResponseBody _ok(Object body) => _json(200, body);
 

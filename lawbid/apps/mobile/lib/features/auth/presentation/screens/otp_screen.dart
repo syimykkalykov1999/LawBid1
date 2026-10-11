@@ -5,6 +5,7 @@ import 'package:flutter/semantics.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'package:lawbid/core/demo_web/demo_http_adapter.dart';
 import 'package:lawbid/core/design_system/design_system.dart';
 import 'package:lawbid/core/l10n/l10n_providers.dart';
 import 'package:lawbid/core/l10n/translator.dart';
@@ -68,6 +69,8 @@ class _OtpScreenState extends ConsumerState<OtpScreen> {
   void initState() {
     super.initState();
     _showAutofilledCode(ref.read(onboardingFlowProvider).autofilledCode);
+    // Web demo: any number works with 000000, so the code is pre-filled.
+    if (kDemoMode) _showAutofilledCode('000000');
     // a11y review (ecc:a11y-architect, docs/CHANGELOG.md stage 1.7):
     // AppOtpField autofocuses its hidden field the instant this screen
     // appears. For a screen-reader user that's disorienting without
