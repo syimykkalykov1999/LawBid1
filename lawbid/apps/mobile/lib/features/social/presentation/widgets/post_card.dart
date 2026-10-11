@@ -1,0 +1,2194 @@
+import 'dart:math' as math;
+import 'dart:ui' show ImageFilter;
+
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:lawbid/core/design_system/design_system.dart';
+import 'package:lawbid/core/l10n/api_error_text.dart';
+import 'package:lawbid/core/l10n/l10n_formats.dart';
+import 'package:lawbid/core/l10n/l10n_providers.dart';
+import 'package:lawbid/core/l10n/translator.dart';
+import 'package:lawbid/core/navigation/app_routes.dart';
+import 'package:lawbid/core/text/tidy_text.dart';
+import 'package:lawbid/features/cases/presentation/widgets/case_format.dart';
+import 'package:lawbid/features/cases/presentation/widgets/practice_art.dart';
+import 'package:lawbid/features/feed/application/feed_topics.dart';
+import 'package:lawbid/features/feed/application/news_flag.dart';
+import 'package:lawbid/features/promotions/application/promotions_providers.dart';
+import 'package:lawbid/features/promotions/presentation/promote_case_card.dart'
+    show BoostButton;
+import 'package:lawbid/features/reels/presentation/reel_video.dart';
+import 'package:lawbid/features/reels/presentation/reels_screen.dart';
+import 'package:lawbid/features/social/application/social_providers.dart';
+import 'package:lawbid/features/social/domain/social_models.dart';
+import 'package:lawbid/features/social/presentation/screens/social_screens.dart'
+    show PracticePostsScreen;
+import 'package:lawbid/features/social/presentation/widgets/attorney_tile.dart'
+    show FollowButton;
+import 'package:lawbid/features/social/presentation/widgets/comments_sheet.dart';
+import 'package:lawbid/features/social/presentation/widgets/post_attachments_sheet.dart';
+import 'package:lawbid/features/social/presentation/widgets/post_sheets.dart';
+import 'package:lawbid/features/social/presentation/widgets/social_format.dart';
+import 'package:lawbid/features/social/social_routes.dart';
+import 'package:lawbid/features/team/application/team_providers.dart'
+    show isAssistantProvider;
+import 'package:lawbid/features/translation/data/content_translation_repository.dart';
+import 'package:lawbid/features/translation/presentation/translatable_text.dart';
+
+/// Owner 2026-09-30: a feed card fills the list viewport down to the nav
+/// bar with no gaps between cards (edge-to-edge list); never
+/// shorter than a readable minimum on tiny screens.
+double feedCardHeight(double viewport) => math.max(440, viewport);
+
+/// docs/05 §2.4 post card, top to bottom: author row (avatar, name,
+/// @username + check, time, "⋯"), photos (carousel with a page indicator,
+/// double tap = like with a heart burst), actions (like, comments, share,
+/// save), likes, text collapsed after 3 lines with tappable #tags, "View
+/// all comments (N)". Text-only posts render as a quote card. The card
+/// always shows the latest local version of the post (likes/saves/edits
+/// from any screen).
+class PostCard extends ConsumerWidget {
+  const PostCard({
+    required this.post,
+    this.inDetail = false,
+    this.feedHeight,
+    this.fromProfile = false,
+    super.key,
+  });
+
+  final Post post;
+
+  /// Owner 2026-10-07: a post opened from someone's grid (their own feed
+  /// of posts, or the post screen reached from it): no author row — the
+  /// viewer already knows whose content it is — and a tap on the photo
+  /// opens the post instead of the gallery.
+  final bool fromProfile;
+
+  /// Owner 2026-10-06: posts without a qualification (practice) and not
+  /// News render like Instagram posts: photo first, actions, likes,
+  /// caption under the photo, comments link, time.
+  static bool isInstagramStyle(Post p) => p.practice == null && !p.isNews;
+
+  /// Owner 2026-09-30: in the feed one card fills the visible area down to
+  /// the nav bar; the photo takes all the space the text leaves, edge to
+  /// edge. Null = natural height (2:1 photo band).
+  final double? feedHeight;
+
+  /// On the post screen: full text, no "view comments" link.
+  final bool inDetail;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final p =
+        ref.watch(postOverridesProvider.select((m) => m[post.id])) ?? post;
+    final t = ref.watch(translatorProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final actions = ref.read(socialActionsProvider);
+
+    Future<void> run(Future<Object?> Function() action) async {
+      final error = await action();
+      if (error != null && context.mounted) {
+        showAppSnackBar(context, errorText(t, error));
+      }
+    }
+
+    // Owner 2026-10-06: a post published without a qualification (and
+    // not News) is an everyday post and looks exactly like an Instagram
+    // post; a post with a qualification keeps the LawBid card.
+    final insta = isInstagramStyle(p);
+    // At large text sizes the text alone may need the whole screen: then
+    // the card keeps its natural height instead of squeezing the photo.
+    // Instagram-style posts always keep their natural height.
+    final fill = feedHeight != null &&
+        !inDetail &&
+        !insta &&
+        MediaQuery.textScalerOf(context).scale(10) <= 13;
+    // Owner 2026-09-30: feed cards run edge to edge (Instagram style):
+    // no side border or rounded corners, hairlines on top and bottom.
+    // Owner 2026-10-07: the open post and a profile's feed of posts are
+    // full width too (Instagram), no card around them.
+    final edge = (feedHeight != null && !inDetail) || inDetail || fromProfile;
+    return Container(
+      height: fill ? feedHeight : null,
+      decoration: BoxDecoration(
+        color: colors.surface,
+        borderRadius: edge ? null : BorderRadius.circular(AppRadii.card),
+        border: edge
+            ? Border.symmetric(horizontal: BorderSide(color: colors.border))
+            : Border.all(color: colors.border),
+        boxShadow: [
+          BoxShadow(
+            color: colors.shadow,
+            blurRadius: AppSizes.cardShadowBlur,
+            offset: const Offset(0, AppSizes.cardShadowOffsetY),
+          ),
+        ],
+      ),
+      clipBehavior: Clip.antiAlias,
+      // Owner 2026-09-30: double tap anywhere on the post likes it, with
+      // the heart (Instagram).
+      child: DoubleTapLike(
+        onLike: () => run(() => actions.like(p)),
+        child: insta && p.video == null && p.media.isEmpty
+            // Owner 2026-10-07: a post without photos or video looks like
+            // a Threads post.
+            ? _ThreadsPost(
+                post: p,
+                inDetail: inDetail,
+                run: run,
+                promotionId: post.promotionId,
+                fromProfile: fromProfile,
+              )
+            : insta
+                ? _InstagramPost(
+                    post: p,
+                    inDetail: inDetail,
+                    run: run,
+                    promotionId: post.promotionId,
+                    fromProfile: fromProfile,
+                  )
+                : inDetail
+                    ? _detail(context, ref, p, t, colors, actions, run)
+                    : _feed(context, p, t, colors, run, fill: fill),
+      ),
+    );
+  }
+
+  /// Owner 2026-09-30 design (feed): author with Follow, topic chips,
+  /// time, bold title, 4 lines of text + "Read more", the photo, actions.
+  Widget _feed(
+    BuildContext context,
+    Post p,
+    Translator t,
+    AppColorTokens colors,
+    Future<void> Function(Future<Object?> Function()) run, {
+    required bool fill,
+  }) {
+    final typography = Theme.of(context).extension<AppTypographyTokens>()!;
+    final (title, rest) = _titleAndRest(p);
+    // Owner 2026-10-05: a promoted post reports the open for the owner's
+    // stats (reach / clicks), like Instagram.
+    final promotionId = post.promotionId;
+    void open() {
+      if (promotionId != null) {
+        ProviderScope.containerOf(context)
+            .read(promotionsRepositoryProvider)
+            .click(promotionId);
+      }
+      context.push(SocialRoutes.post(p.id, fromProfile: fromProfile));
+    }
+
+    // Owner 2026-09-30: the author's photos (up to 9) or, when there are
+    // none, the default art of the post's practice — full card width.
+    // Owner 2026-10-01: a reel plays muted in the card; a tap opens the
+    // full-screen reels starting with it.
+    final picture = p.video != null
+        ? InlineReel(post: p, onOpen: () => ReelsScreen.open(context, from: p))
+        : p.media.isNotEmpty
+            ? PostMediaCarousel(
+                media: p.media,
+                semanticLabel: t.t('post.media.label'),
+                // The card sizes the photo box (a 2:1 band or the rest of a
+                // full-height card).
+                fill: true,
+                onDoubleTap: () => run(
+                  () => ProviderScope.containerOf(context)
+                      .read(socialActionsProvider)
+                      .like(p),
+                ),
+              )
+            : PracticePhoto(
+                // Owner 2026-09-30: the post's qualification; older posts by
+                // their topic hashtag.
+                categoryCode: p.practice?.categoryCode ??
+                    p.tags
+                        .map(topicCategory)
+                        .firstWhere((c) => c != null, orElse: () => null),
+                practiceCode: p.practice?.code,
+                // Owner 2026-10-05: no practice photo → the pattern this
+                // post id picks (the same one its grid cover uses).
+                seed: p.id,
+              );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (!fromProfile)
+          _AuthorRow(post: p, sponsored: post.promotionId != null)
+        else
+          const SizedBox(height: AppSpacing.md),
+        if (p.tags.isNotEmpty || p.practice != null || p.isNews)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.sm,
+            ),
+            child: _TopicChips(
+              tags: p.tags,
+              practice: p.practice,
+              news: p.isNews,
+            ),
+          ),
+        AppPressable(
+          onTap: open,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: typography.titleMedium.copyWith(
+                    fontFamily: typography.body.fontFamily,
+                    color: colors.text,
+                    fontWeight: FontWeight.w700,
+                    height: 1.25,
+                  ),
+                ),
+                if (rest.isNotEmpty) ...[
+                  const SizedBox(height: AppSpacing.sm),
+                  Text(
+                    rest,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: typography.body.copyWith(
+                      color: colors.text,
+                      height: 1.45,
+                    ),
+                  ),
+                  const SizedBox(height: AppSpacing.sm),
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          t.t('post.readMore'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: typography.body.copyWith(
+                            color: colors.goldDark,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      AppIcon(
+                        AppIcons.chevronRightRounded,
+                        size: 20,
+                        color: colors.goldDark,
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        if (fill)
+          Expanded(child: AppPressable(onTap: open, child: picture))
+        else
+          AspectRatio(
+            aspectRatio: 2,
+            child: AppPressable(onTap: open, child: picture),
+          ),
+        // Owner 2026-09-30: time and "Public" sit next to Save.
+        _ActionsBar(post: p, run: run, showTime: true),
+        const SizedBox(height: AppSpacing.xs),
+      ],
+    );
+  }
+
+  /// Owner 2026-09-30: the post's own title and its whole text; older
+  /// posts split their text.
+  static (String, String) _titleAndRest(Post p) => _titleAndBody(p, p.body);
+
+  /// [_titleAndRest] with [body] in place of the post's (a translation).
+  static (String, String) _titleAndBody(Post p, String body) {
+    final title = p.title;
+    if (title != null && title.trim().isNotEmpty) {
+      return (title.trim(), body.trim());
+    }
+    return _split(body);
+  }
+
+  /// "Title" = the first line (or sentence) of the post, the rest below.
+  static (String, String) _split(String body) {
+    final text = tidyText(body);
+    final nl = text.indexOf('\n');
+    if (nl > 0 && nl <= 120) {
+      return (text.substring(0, nl).trim(), text.substring(nl + 1).trim());
+    }
+    final dot = text.indexOf(RegExp(r'[.!?](\s|$)'));
+    if (dot > 0 && dot <= 100) {
+      return (
+        text.substring(0, dot + 1).trim(),
+        text.substring(dot + 1).trim(),
+      );
+    }
+    return (text, '');
+  }
+
+  /// Owner 2026-09-30 design, open post: author, topics, title, full text,
+  /// photos, then the actions.
+  Widget _detail(
+    BuildContext context,
+    WidgetRef ref,
+    Post p,
+    Translator t,
+    AppColorTokens colors,
+    SocialActions actions,
+    Future<void> Function(Future<Object?> Function()) run,
+  ) {
+    final typography = Theme.of(context).extension<AppTypographyTokens>()!;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (!fromProfile)
+          _AuthorRow(post: p, sponsored: post.promotionId != null)
+        else
+          const SizedBox(height: AppSpacing.md),
+        if (p.tags.isNotEmpty || p.practice != null || p.isNews)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.md,
+            ),
+            child: _TopicChips(
+              tags: p.tags,
+              practice: p.practice,
+              news: p.isNews,
+            ),
+          ),
+        _TimeLine(post: p),
+        // Owner 2026-10-05: «Перевести» under the text (posts zone); the
+        // translation replaces the body on screen, the title stays.
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+          child: TranslatableText(
+            kind: TranslatableKind.post,
+            id: p.id,
+            text: p.body,
+            enabled: !p.isMine,
+            builder: (context, body) {
+              final (title, rest) = _titleAndBody(p, body);
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // OQ-042: @mentions / #tags tappable in the title line too.
+                  PostBodyText(
+                    body: title,
+                    expanded: true,
+                    mentions: p.mentions,
+                    style: typography.titleLarge.copyWith(
+                      fontFamily: typography.body.fontFamily,
+                      color: colors.text,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  if (rest.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: AppSpacing.sm),
+                      child: PostBodyText(
+                        body: rest,
+                        expanded: true,
+                        mentions: p.mentions,
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: AppSpacing.md),
+        if (p.video != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(AppRadii.card - 2),
+              child: AspectRatio(
+                aspectRatio: 4 / 5,
+                child: InlineReel(
+                  post: p,
+                  onOpen: () => ReelsScreen.open(context, from: p),
+                ),
+              ),
+            ),
+          ),
+        if (p.media.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(AppRadii.card - 2),
+              child: PostMediaCarousel(
+                media: p.media,
+                semanticLabel: t.t('post.media.label'),
+                onDoubleTap: () => run(() => actions.like(p)),
+                // All (up to 9) photos full screen: swipe and zoom.
+                onTap: (i) => showPhotoGallery(
+                  context,
+                  urls: [for (final m in p.media) m.url],
+                  initial: i,
+                  closeLabel: t.t('common.close'),
+                ),
+              ),
+            ),
+          ),
+        // Owner 2026-10-07 (bug 13): «Посмотреть · N» opens the files.
+        if (p.attachments.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              AppSpacing.md,
+              AppSpacing.lg,
+              0,
+            ),
+            child: PostAttachmentsButton(
+              media: p.media,
+              documents: p.attachments,
+            ),
+          ),
+        // Owner 2026-10-07: the comment button opens the comments sheet.
+        _ActionsBar(post: p, run: run, boost: false),
+        if (p.likeCount > 0)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.xs,
+            ),
+            child: Text(
+              SocialFormat.plural(
+                t,
+                ref.watch(l10nFormatsProvider),
+                'post.likes',
+                p.likeCount,
+              ),
+              style: Theme.of(context)
+                  .extension<AppTypographyTokens>()!
+                  .bodySmall
+                  .copyWith(
+                    color: colors.text,
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
+          ),
+        if (p.pendingReview)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              AppSpacing.xs,
+              AppSpacing.lg,
+              0,
+            ),
+            child: Row(
+              children: [
+                AppIcon(
+                  AppIcons.hourglassTopRounded,
+                  size: 14,
+                  color: colors.textSecondary,
+                ),
+                const SizedBox(width: AppSpacing.xs),
+                Flexible(
+                  child: Text(
+                    t.t('post.pending_review'),
+                    style: Theme.of(context)
+                        .extension<AppTypographyTokens>()!
+                        .caption
+                        .copyWith(color: colors.textSecondary),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        if (p.editedAt != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+            child: Text(
+              t.t('post.edited'),
+              style: Theme.of(context)
+                  .extension<AppTypographyTokens>()!
+                  .caption
+                  .copyWith(color: colors.textSecondary),
+            ),
+          ),
+        if (!inDetail && p.commentCount > 0)
+          Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: TextButton(
+              onPressed: () => showCommentsSheet(
+                context,
+                postId: p.id,
+                commentsEnabled: p.commentsEnabled,
+              ),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
+                foregroundColor: colors.textSecondary,
+              ),
+              child: Text(
+                t.t('post.viewComments', {
+                  'count': SocialFormat.count(
+                    ref.watch(l10nFormatsProvider),
+                    p.commentCount,
+                  ),
+                }),
+              ),
+            ),
+          ),
+        const SizedBox(height: AppSpacing.md),
+      ],
+    );
+  }
+}
+
+/// Owner 2026-10-06: a post without a qualification looks exactly like an
+/// Instagram post, top to bottom: author row, the photos (or the reel)
+/// full width at their own ratio (4:5 … 1.91:1), the actions (like,
+/// comment, share … save), "N likes", the author's name in bold followed
+/// by the caption (#tags and @mentions tappable, "more" after two lines),
+/// "View all comments (N)" and the time. Text-only posts keep the same
+/// order with the text in place of the photo. On the post screen the
+/// caption is whole, translatable, and the documents follow the photos.
+class _InstagramPost extends ConsumerWidget {
+  const _InstagramPost({
+    required this.post,
+    required this.inDetail,
+    required this.run,
+    this.promotionId,
+    this.fromProfile = false,
+  });
+
+  final Post post;
+  final bool inDetail;
+  final bool fromProfile;
+
+  /// A paid promoted post: «Реклама» under the name, opens are reported.
+  final String? promotionId;
+  final Future<void> Function(Future<Object?> Function()) run;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final p = post;
+    final t = ref.watch(translatorProvider);
+    final f = ref.watch(l10nFormatsProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final type = Theme.of(context).extension<AppTypographyTokens>()!;
+    final actions = ref.read(socialActionsProvider);
+    void open() {
+      final id = promotionId;
+      if (id != null) {
+        ref.read(promotionsRepositoryProvider).click(id);
+      }
+      context.push(SocialRoutes.post(p.id, fromProfile: fromProfile));
+    }
+
+    final hasMedia = p.video != null || p.media.isNotEmpty;
+    final caption = [
+      if (p.title != null && p.title!.trim().isNotEmpty) p.title!.trim(),
+      p.body.trim(),
+    ].where((s) => s.isNotEmpty).join('\n');
+    const side = EdgeInsets.symmetric(horizontal: AppSpacing.lg);
+
+    Widget captionText(String text) => PostBodyText(
+          // A new text (translation) starts collapsed again.
+          key: ValueKey(text.hashCode),
+          body: text,
+          leading: hasMedia ? p.author.username : null,
+          onLeadingTap: () => openAuthorProfile(context, ref, p.author),
+          expanded: inDetail,
+          // Owner 2026-10-07: two lines in the feed, the rest inside.
+          collapsedLines: 2,
+          onMore: inDetail ? null : open,
+          mentions: p.mentions,
+          large: !hasMedia,
+        );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (!fromProfile) _AuthorRow(post: p, sponsored: promotionId != null),
+        if (p.video != null)
+          AspectRatio(
+            aspectRatio: p.video!.aspectRatio.clamp(0.8, 1.91),
+            child: InlineReel(
+              post: p,
+              onOpen: () => ReelsScreen.open(context, from: p),
+            ),
+          )
+        else if (p.media.isNotEmpty)
+          // Full width at the first photo's own ratio; tap = full screen
+          // gallery (swipe, zoom), double tap = like.
+          PostMediaCarousel(
+            media: p.media,
+            semanticLabel: t.t('post.media.label'),
+            onDoubleTap: () => run(() => actions.like(p)),
+            // Owner 2026-10-07: in someone's feed of posts a tap opens
+            // the post; inside it, the full-screen gallery.
+            onTap: fromProfile && !inDetail
+                ? (_) => open()
+                : (i) => showPhotoGallery(
+                      context,
+                      urls: [for (final m in p.media) m.url],
+                      initial: i,
+                      closeLabel: t.t('common.close'),
+                    ),
+          )
+        else if (caption.isNotEmpty)
+          // Text only: the text takes the photo's place.
+          Padding(
+            padding: side,
+            child: inDetail
+                ? TranslatableText(
+                    kind: TranslatableKind.post,
+                    id: p.id,
+                    text: caption,
+                    enabled: !p.isMine,
+                    builder: (context, text) => captionText(text),
+                  )
+                : captionText(caption),
+          ),
+        _ActionsBar(
+          post: p,
+          run: run,
+          showCounts: false,
+          boost: !inDetail,
+          // Inside the post the comment field is right below.
+          // Owner 2026-10-07: the comment button opens the comments sheet,
+          // inside the post too.
+        ),
+        if (p.likeCount > 0)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.xs,
+            ),
+            child: Text(
+              SocialFormat.plural(t, f, 'post.likes', p.likeCount),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: type.bodySmall.copyWith(
+                color: colors.text,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        if (hasMedia && caption.isNotEmpty)
+          Padding(
+            padding: side,
+            child: inDetail
+                ? TranslatableText(
+                    kind: TranslatableKind.post,
+                    id: p.id,
+                    text: caption,
+                    enabled: !p.isMine,
+                    builder: (context, text) => captionText(text),
+                  )
+                : captionText(caption),
+          ),
+        // Owner 2026-10-07 (bug 13): one small «Посмотреть · N» button;
+        // the photos and files open in a sheet.
+        if (p.attachments.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              AppSpacing.sm,
+              AppSpacing.lg,
+              0,
+            ),
+            child: PostAttachmentsButton(
+              media: p.media,
+              documents: p.attachments,
+            ),
+          ),
+        if (!inDetail && p.commentCount > 0)
+          AppPressable(
+            onTap: () => showCommentsSheet(
+              context,
+              postId: p.id,
+              commentsEnabled: p.commentsEnabled,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(
+                AppSpacing.lg,
+                AppSpacing.xs,
+                AppSpacing.lg,
+                0,
+              ),
+              child: Text(
+                t.t('post.viewComments', {
+                  'count': SocialFormat.count(f, p.commentCount),
+                }),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: type.bodySmall.copyWith(color: colors.textSecondary),
+              ),
+            ),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(
+            AppSpacing.lg,
+            AppSpacing.xs,
+            AppSpacing.lg,
+            0,
+          ),
+          child: Text(
+            SocialFormat.ago(t, f, p.createdAt),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: type.caption.copyWith(color: colors.textSecondary),
+          ),
+        ),
+        if (inDetail && p.editedAt != null)
+          Padding(
+            padding: side,
+            child: Text(
+              t.t('post.edited'),
+              style: type.caption.copyWith(color: colors.textSecondary),
+            ),
+          ),
+        if (inDetail && p.pendingReview)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              AppSpacing.xs,
+              AppSpacing.lg,
+              0,
+            ),
+            child: Text(
+              t.t('post.pending_review'),
+              style: type.caption.copyWith(color: colors.textSecondary),
+            ),
+          ),
+        const SizedBox(height: AppSpacing.md),
+      ],
+    );
+  }
+}
+
+/// Owner 2026-10-07: a post without photos or video, exactly like Threads:
+/// the avatar on the left, the name and time, the text, then the actions
+/// with their counts.
+class _ThreadsPost extends ConsumerWidget {
+  const _ThreadsPost({
+    required this.post,
+    required this.inDetail,
+    required this.run,
+    this.promotionId,
+    this.fromProfile = false,
+  });
+
+  final Post post;
+  final bool inDetail;
+  final bool fromProfile;
+  final String? promotionId;
+  final Future<void> Function(Future<Object?> Function()) run;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final p = post;
+    final a = p.author;
+    final t = ref.watch(translatorProvider);
+    final f = ref.watch(l10nFormatsProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final type = Theme.of(context).extension<AppTypographyTokens>()!;
+    final actions = ref.read(socialActionsProvider);
+    void open() {
+      final id = promotionId;
+      if (id != null) ref.read(promotionsRepositoryProvider).click(id);
+      context.push(SocialRoutes.post(p.id, fromProfile: fromProfile));
+    }
+
+    final title = (p.title ?? '').trim();
+    final body = p.body.trim();
+    final text = [title, body].where((s) => s.isNotEmpty).join('\n');
+    Widget bodyText(String s) => PostBodyText(
+          key: ValueKey(s.hashCode),
+          body: s,
+          expanded: inDetail,
+          collapsedLines: 6,
+          onMore: inDetail ? null : open,
+          mentions: p.mentions,
+          large: inDetail,
+        );
+
+    Widget action(Widget icon, int count) => Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            icon,
+            if (count > 0)
+              Padding(
+                padding: const EdgeInsetsDirectional.only(end: AppSpacing.sm),
+                child: Text(
+                  SocialFormat.count(f, count),
+                  style: type.bodySmall.copyWith(color: colors.textSecondary),
+                ),
+              ),
+          ],
+        );
+
+    return AppPressable(
+      onTap: inDetail ? null : open,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(
+          AppSpacing.lg,
+          AppSpacing.md,
+          AppSpacing.xs,
+          AppSpacing.xs,
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GestureDetector(
+              onTap: () => openAuthorProfile(context, ref, a),
+              child: GoldRingAvatar(
+                url: a.avatarUrl,
+                initials: a.initials,
+                size: 36,
+                ring: a.verified,
+              ),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (p.repostedBy case final by?)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: AppSpacing.xs),
+                      child: Row(
+                        children: [
+                          AppIcon(
+                            AppIcons.autoModeRounded,
+                            size: 14,
+                            color: colors.textSecondary,
+                          ),
+                          const SizedBox(width: AppSpacing.xs),
+                          Flexible(
+                            child: Text(
+                              t.t(
+                                'post.repostedBy',
+                                {'username': by.username},
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: type.caption
+                                  .copyWith(color: colors.textSecondary),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Row(
+                          children: [
+                            Flexible(
+                              child: GestureDetector(
+                                onTap: () => openAuthorProfile(context, ref, a),
+                                child: Text(
+                                  a.username,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: type.bodySmall.copyWith(
+                                    color: colors.text,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            if (a.verified) ...[
+                              const SizedBox(width: AppSpacing.xs),
+                              VerifiedCheck(
+                                label: t.t('post.verified'),
+                                size: 14,
+                                gold: a.isClient,
+                              ),
+                            ],
+                            const SizedBox(width: AppSpacing.sm),
+                            Flexible(
+                              child: Text(
+                                promotionId != null
+                                    ? t.t('promote.sponsored')
+                                    : SocialFormat.ago(t, f, p.createdAt),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: type.caption
+                                    .copyWith(color: colors.textSecondary),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      AppIconButton(
+                        icon: AppIcon(
+                          AppIcons.moreHorizRounded,
+                          size: 20,
+                          color: colors.textSecondary,
+                        ),
+                        semanticLabel: t.t('post.menu'),
+                        onPressed: () => showPostMenu(context, ref, p),
+                      ),
+                    ],
+                  ),
+                  if (text.isNotEmpty && inDetail)
+                    TranslatableText(
+                      kind: TranslatableKind.post,
+                      id: p.id,
+                      text: text,
+                      enabled: !p.isMine,
+                      builder: (context, s) => bodyText(s),
+                    )
+                  else if (text.isNotEmpty)
+                    bodyText(text),
+                  if (p.attachments.isNotEmpty) ...[
+                    const SizedBox(height: AppSpacing.sm),
+                    PostAttachmentsButton(
+                      media: p.media,
+                      documents: p.attachments,
+                    ),
+                  ],
+                  Row(
+                    children: [
+                      action(
+                        BounceIcon(
+                          active: p.likedByMe,
+                          activeIcon: AppIcons.favoriteRounded,
+                          icon: AppIcons.favoriteBorderRounded,
+                          activeColor: colors.danger,
+                          size: 20,
+                          label: t.t(p.likedByMe ? 'post.unlike' : 'post.like'),
+                          onTap: () => run(() => actions.toggleLike(p)),
+                        ),
+                        p.likeCount,
+                      ),
+                      action(
+                        BounceIcon(
+                          active: false,
+                          activeIcon: AppIcons.modeCommentOutlined,
+                          icon: AppIcons.modeCommentOutlined,
+                          size: 20,
+                          label: t.t('post.comments'),
+                          onTap: () => showCommentsSheet(
+                            context,
+                            postId: p.id,
+                            commentsEnabled: p.commentsEnabled,
+                          ),
+                        ),
+                        p.commentCount,
+                      ),
+                      // Owner 2026-10-07: Threads-style repost.
+                      action(
+                        BounceIcon(
+                          active: p.repostedByMe,
+                          activeIcon: AppIcons.autoModeRounded,
+                          icon: AppIcons.autoModeRounded,
+                          activeColor: colors.success,
+                          size: 20,
+                          label: t.t(
+                            p.repostedByMe ? 'post.unrepost' : 'post.repost',
+                          ),
+                          onTap: () => run(() => actions.toggleRepost(p)),
+                        ),
+                        p.repostCount,
+                      ),
+                      action(
+                        BounceIcon(
+                          active: false,
+                          activeIcon: AppIcons.sendOutlined,
+                          icon: AppIcons.sendOutlined,
+                          size: 20,
+                          label: t.t('post.share'),
+                          onTap: () => sharePost(context, ref, p),
+                        ),
+                        p.shareCount,
+                      ),
+                      Expanded(
+                        child: !inDetail &&
+                                p.isMine &&
+                                !ref.watch(isAssistantProvider)
+                            ? Align(
+                                alignment: AlignmentDirectional.centerEnd,
+                                child: BoostButton(postId: p.id),
+                              )
+                            : const SizedBox.shrink(),
+                      ),
+                      BounceIcon(
+                        active: p.savedByMe,
+                        activeIcon: AppIcons.bookmarkRounded,
+                        icon: AppIcons.bookmarkBorderRounded,
+                        activeColor: colors.gold,
+                        size: 20,
+                        label: t.t(p.savedByMe ? 'post.unsave' : 'post.save'),
+                        onTap: () => run(() => actions.toggleSave(p)),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// "2 hours ago · Public" under the chips (owner design).
+class _TimeLine extends ConsumerWidget {
+  const _TimeLine({required this.post, this.inline = false});
+
+  final Post post;
+
+  /// In the actions row (no side padding, shrinks with ellipsis).
+  final bool inline;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ref.watch(translatorProvider);
+    final f = ref.watch(l10nFormatsProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final type = Theme.of(context).extension<AppTypographyTokens>()!;
+    return Padding(
+      padding: inline
+          ? const EdgeInsetsDirectional.only(end: AppSpacing.xs)
+          : const EdgeInsets.fromLTRB(
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.sm,
+            ),
+      child: Row(
+        mainAxisSize: inline ? MainAxisSize.min : MainAxisSize.max,
+        children: [
+          Flexible(
+            child: Text(
+              SocialFormat.ago(t, f, post.createdAt),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: type.caption.copyWith(color: colors.textSecondary),
+            ),
+          ),
+          const SizedBox(width: AppSpacing.sm),
+          // Next to Save only the globe (with its label for screen
+          // readers) so the time is never cut.
+          Semantics(
+            label: t.t('post.public'),
+            child: AppIcon(
+              AppIcons.publicRounded,
+              size: 14,
+              color: colors.textSecondary,
+            ),
+          ),
+          if (!inline) ...[
+            const SizedBox(width: AppSpacing.xs),
+            Flexible(
+              child: Text(
+                t.t('post.public'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: type.caption.copyWith(color: colors.textSecondary),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// The post's bold first line and the rest (the feed card's split), for
+/// other views such as the Search grid.
+(String, String) splitPostBody(String body) => PostCard._split(body);
+
+/// Practice category a hashtag stands for (the client topic slider and
+/// the main chip icon use the same map).
+String? topicCategory(String tag) => switch (tag.toLowerCase()) {
+      'immigration' || 'greencard' || 'visa' || 'asylum' => 'immigration',
+      'familylaw' || 'divorce' || 'custody' || 'childcustody' => 'family_law',
+      'traffic' ||
+      'trafficticket' ||
+      'speeding' ||
+      'tickets' =>
+        'traffic_tickets',
+      'dui' || 'dwi' => 'dui_and_dwi',
+      'criminaldefense' || 'criminal' => 'criminal_defense',
+      'personalinjury' || 'injury' || 'caraccident' => 'personal_injury',
+      'realestate' => 'real_estate',
+      'employment' || 'workplace' => 'employment_and_labor',
+      'bankruptcy' || 'debt' => 'bankruptcy_and_debt',
+      // Every other practice's topic tag (owner 2026-09-30).
+      _ => categoryForTopicTag(tag),
+    };
+
+/// "greencard" → "Green Card"; unknown tags get a capital letter.
+String topicLabel(String tag) {
+  const known = {
+    'familylaw': 'Family Law',
+    'trafficticket': 'Traffic Ticket',
+    'greencard': 'Green Card',
+    'personalinjury': 'Personal Injury',
+    'criminaldefense': 'Criminal Defense',
+    'dui': 'DUI',
+    'realestate': 'Real Estate',
+    'childcustody': 'Child Custody',
+    'caraccident': 'Car Accident',
+  };
+  final k = known[tag.toLowerCase()];
+  if (k != null) return k;
+  // A practice topic tag (OQ-034): its category's name.
+  final cat = categoryForTopicTag(tag);
+  if (cat != null) return kPracticeCategoryNamesEn[cat] ?? tag;
+  return tag.isEmpty ? tag : tag[0].toUpperCase() + tag.substring(1);
+}
+
+/// Topic chips (owner design): the post's qualification as the main navy
+/// pill (tap → that qualification's posts), "News" when it is news, then
+/// up to three quiet hashtag pills (tap → the topic page).
+class _TopicChips extends ConsumerWidget {
+  const _TopicChips({required this.tags, this.practice, this.news = false});
+
+  final List<String> tags;
+  final PostPractice? practice;
+  final bool news;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ref.watch(translatorProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final typography = Theme.of(context).extension<AppTypographyTokens>()!;
+    Widget pill({
+      required String label,
+      required bool main,
+      required VoidCallback? onTap,
+      IconData? icon,
+      bool gold = false,
+    }) =>
+        AppPressable(
+          onTap: onTap,
+          child: Container(
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.md,
+              vertical: AppSpacing.xs + 2,
+            ),
+            decoration: BoxDecoration(
+              color: gold
+                  ? colors.goldTint
+                  : (main
+                      ? colors.navy
+                      : colors.textSecondary.withValues(alpha: 0.10)),
+              borderRadius: BorderRadius.circular(AppRadii.pill),
+              border: gold ? Border.all(color: colors.goldStroke) : null,
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (icon != null) ...[
+                  AppIcon(
+                    icon,
+                    size: 15,
+                    color: gold ? colors.goldDark : colors.goldLight,
+                  ),
+                  const SizedBox(width: AppSpacing.xs),
+                ],
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: typography.caption.copyWith(
+                      color: gold
+                          ? colors.goldDark
+                          : (main ? Colors.white : colors.textSecondary),
+                      fontWeight:
+                          main || gold ? FontWeight.w600 : FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+    final pr = practice;
+    final quietTags = pr == null ? tags.skip(1).take(3) : tags.take(3);
+    final topics = Wrap(
+      spacing: AppSpacing.sm,
+      runSpacing: AppSpacing.xs,
+      children: [
+        if (pr != null)
+          pill(
+            label: CaseFormat.practice(t, pr.i18nKey, pr.nameEn),
+            main: true,
+            icon: practiceGlyph(pr.categoryCode),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => PracticePostsScreen(practice: pr.code),
+              ),
+            ),
+          )
+        else if (tags.isNotEmpty)
+          pill(
+            label: topicLabel(tags.first),
+            main: true,
+            icon: practiceGlyph(topicCategory(tags.first)),
+            onTap: () => context.push(SocialRoutes.tag(tags.first)),
+          ),
+        for (final tag in quietTags)
+          pill(
+            label: topicLabel(tag),
+            main: false,
+            onTap: () => context.push(SocialRoutes.tag(tag)),
+          ),
+      ],
+    );
+    // Owner 2026-10-06: no "News" label while News is off.
+    if (!news || !ref.watch(newsEnabledProvider)) return topics;
+    // Owner 2026-09-30: "News" sits at the right edge of the row, where
+    // the Save button lines up below.
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(child: topics),
+        const SizedBox(width: AppSpacing.sm),
+        // Bounded so the pill's Flexible label can ellipsize.
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 140),
+          child: pill(
+            label: t.t('post.kind.news'),
+            main: false,
+            gold: true,
+            icon: AppIcons.newspaperRounded,
+            // A label, not a filter: there is no news-only route.
+            onTap: null,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _AuthorRow extends ConsumerWidget {
+  const _AuthorRow({required this.post, this.sponsored = false});
+
+  final Post post;
+
+  /// Owner 2026-10-05: a paid promoted post says «Реклама» under the name.
+  final bool sponsored;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ref.watch(translatorProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final type = Theme.of(context).extension<AppTypographyTokens>()!;
+    final a = post.author;
+    return Padding(
+      padding: const EdgeInsetsDirectional.fromSTEB(
+        AppSpacing.lg,
+        AppSpacing.md,
+        AppSpacing.xs,
+        AppSpacing.md,
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Semantics(
+              button: true,
+              label: t.t('post.author.open', {'name': a.displayName}),
+              child: AppPressable(
+                onTap: () => openAuthorProfile(context, ref, a),
+                child: Row(
+                  children: [
+                    GoldRingAvatar(
+                      url: a.avatarUrl,
+                      initials: a.initials,
+                      size: AppSizes.cardAvatar,
+                      ring: a.verified,
+                    ),
+                    const SizedBox(width: AppSpacing.md),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  a.displayName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: type.body.copyWith(
+                                    color: colors.text,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              if (a.verified) ...[
+                                const SizedBox(width: AppSpacing.xs),
+                                VerifiedCheck(
+                                  label: t.t('post.verified'),
+                                  gold: a.isClient,
+                                ),
+                              ],
+                            ],
+                          ),
+                          Text(
+                            sponsored
+                                ? t.t('promote.sponsored')
+                                : post.locationName ??
+                                    (a.isClient
+                                        ? '@${a.username} · '
+                                            '${t.t('person.client')}'
+                                        : a.verified
+                                            ? t.t('post.licensedAttorney')
+                                            : '@${a.username}'),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: type.caption
+                                .copyWith(color: colors.textSecondary),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          // Owner 2026-09-30: a working Follow on the card.
+          if (!post.isMine) ...[
+            // Capped so a long "Follow" can't squeeze the author's name.
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 136),
+              child: FollowButton(attorneyId: a.id, initial: a.isFollowing),
+            ),
+            const SizedBox(width: AppSpacing.xs),
+          ],
+          AppIconButton(
+            icon: const AppIcon(AppIcons.moreHorizRounded),
+            semanticLabel: t.t('post.menu'),
+            onPressed: () => showPostMenu(context, ref, post),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// docs/05 §2.4 "синяя галочка" next to verified attorneys.
+class VerifiedCheck extends StatelessWidget {
+  const VerifiedCheck({
+    required this.label,
+    this.size = 16,
+    this.gold = false,
+    super.key,
+  });
+
+  final String label;
+  final double size;
+
+  /// Owner 2026-10-02: attorneys wear the blue check, clients the gold one
+  /// (a paid, document-checked client).
+  final bool gold;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    return Semantics(
+      label: label,
+      child: AppIcon(
+        AppIcons.verifiedRounded,
+        size: size,
+        color: gold ? colors.gold : colors.info,
+      ),
+    );
+  }
+}
+
+/// An avatar with a thin gold ring for verified attorneys.
+class GoldRingAvatar extends StatelessWidget {
+  const GoldRingAvatar({
+    required this.initials,
+    required this.size,
+    this.url,
+    this.ring = false,
+    super.key,
+  });
+
+  final String? url;
+  final String initials;
+  final double size;
+  final bool ring;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final avatar = AppAvatar(
+      imageProvider: url == null
+          ? null
+          : CachedNetworkImageProvider(
+              url!,
+              // Signed URLs change per request: cache by the stable path.
+              cacheKey: Uri.parse(url!).path,
+            ),
+      initials: initials,
+      size: ring ? size - 4 : size,
+    );
+    if (!ring) return avatar;
+    return Container(
+      width: size,
+      height: size,
+      padding: const EdgeInsets.all(2),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [colors.goldLight, colors.gold, colors.goldDark],
+        ),
+      ),
+      child: avatar,
+    );
+  }
+}
+
+class PostBodyText extends ConsumerStatefulWidget {
+  const PostBodyText({
+    required this.body,
+    this.expanded = false,
+    this.large = false,
+    this.mentions = const [],
+    this.height = 1.45,
+    this.style,
+    this.leading,
+    this.onLeadingTap,
+    this.collapsedLines = 3,
+    this.onMore,
+    super.key,
+  });
+
+  /// Owner 2026-10-07: in the feed the text never grows in place; "more"
+  /// (or a tap on the text) opens the post with the whole text instead.
+  final VoidCallback? onMore;
+
+  /// Overrides the text style (the post's title line).
+  final TextStyle? style;
+
+  /// Owner 2026-10-06: the author's name in bold before the caption
+  /// (Instagram); [onLeadingTap] opens their profile.
+  final String? leading;
+  final VoidCallback? onLeadingTap;
+
+  /// Lines shown before "more".
+  final int collapsedLines;
+
+  final String body;
+
+  /// OQ-042: real people among the @handles — tappable, open the profile.
+  final List<Mention> mentions;
+  final double height;
+  final bool expanded;
+  final bool large;
+
+  @override
+  ConsumerState<PostBodyText> createState() => _PostBodyTextState();
+}
+
+class _PostBodyTextState extends ConsumerState<PostBodyText> {
+  /// Pasted runs of empty lines collapse to one (owner 2026-10-07).
+  String get _body => tidyText(widget.body);
+  static final _token =
+      RegExp(r'(#[\p{L}\p{N}_]+|@[A-Za-z0-9._]+)', unicode: true);
+  late bool _expanded = widget.expanded;
+  final _recognizers = <TapGestureRecognizer>[];
+
+  @override
+  void dispose() {
+    for (final r in _recognizers) {
+      r.dispose();
+    }
+    super.dispose();
+  }
+
+  List<InlineSpan> _spans(AppColorTokens colors) {
+    for (final r in _recognizers) {
+      r.dispose();
+    }
+    _recognizers.clear();
+    final spans = <InlineSpan>[];
+    final lead = widget.leading;
+    if (lead != null && lead.isNotEmpty) {
+      final onTap = widget.onLeadingTap;
+      TapGestureRecognizer? r;
+      if (onTap != null) {
+        r = TapGestureRecognizer()..onTap = onTap;
+        _recognizers.add(r);
+      }
+      spans
+        ..add(
+          TextSpan(
+            text: lead,
+            style: TextStyle(color: colors.text, fontWeight: FontWeight.w700),
+            recognizer: r,
+          ),
+        )
+        ..add(const TextSpan(text: ' '));
+    }
+    var last = 0;
+    for (final m in _token.allMatches(_body)) {
+      if (m.start > last) {
+        spans.add(TextSpan(text: _body.substring(last, m.start)));
+      }
+      final token = m.group(0)!;
+      if (token.startsWith('#')) {
+        final tag = token.substring(1).toLowerCase();
+        final r = TapGestureRecognizer()
+          ..onTap = () => context.push(SocialRoutes.tag(tag));
+        _recognizers.add(r);
+        spans.add(
+          TextSpan(
+            text: token,
+            style:
+                TextStyle(color: colors.goldDark, fontWeight: FontWeight.w600),
+            recognizer: r,
+          ),
+        );
+      } else {
+        // "@anna." at the end of a sentence: the dot is not the name.
+        final trimmed = token.replaceFirst(RegExp(r'\.+$'), '');
+        final tail = token.substring(trimmed.length);
+        final handle = trimmed.substring(1).toLowerCase();
+        final who =
+            widget.mentions.where((x) => x.username == handle).firstOrNull;
+        if (who == null) {
+          spans.add(
+            TextSpan(
+              text: trimmed,
+              style: TextStyle(color: colors.text, fontWeight: FontWeight.w600),
+            ),
+          );
+        } else {
+          final r = TapGestureRecognizer()
+            ..onTap = () => context.push(
+                  who.isAttorney
+                      ? AppRoutes.lawyer(who.username)
+                      : AppRoutes.client(who.username),
+                );
+          _recognizers.add(r);
+          spans.add(
+            TextSpan(
+              text: trimmed,
+              style: TextStyle(
+                color: colors.goldDark,
+                fontWeight: FontWeight.w700,
+              ),
+              recognizer: r,
+            ),
+          );
+        }
+        if (tail.isNotEmpty) spans.add(TextSpan(text: tail));
+      }
+      last = m.end;
+    }
+    if (last < _body.length) {
+      spans.add(TextSpan(text: _body.substring(last)));
+    }
+    return spans;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = ref.watch(translatorProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final type = Theme.of(context).extension<AppTypographyTokens>()!;
+    final style = widget.style ??
+        (widget.large ? type.body : type.bodySmall)
+            .copyWith(color: colors.text, height: widget.height);
+    final text = Text.rich(
+      TextSpan(children: _spans(colors), style: style),
+      maxLines: _expanded ? null : widget.collapsedLines,
+      overflow: _expanded ? TextOverflow.visible : TextOverflow.ellipsis,
+    );
+    if (_expanded) return text;
+    return LayoutBuilder(
+      builder: (context, box) {
+        final painter = TextPainter(
+          text: TextSpan(
+            text: widget.leading == null ? _body : '${widget.leading} $_body',
+            style: style,
+          ),
+          maxLines: widget.collapsedLines,
+          textDirection: Directionality.of(context),
+          textScaler: MediaQuery.textScalerOf(context),
+        )..layout(maxWidth: box.maxWidth);
+        if (!painter.didExceedMaxLines) return text;
+        final more = widget.onMore ?? () => setState(() => _expanded = true);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (widget.onMore == null)
+              text
+            else
+              GestureDetector(onTap: more, child: text),
+            AppPressable(
+              onTap: more,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+                child: Text(
+                  t.t('post.more'),
+                  style: type.bodySmall.copyWith(color: colors.textSecondary),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Photos of a post: swipe between them, a gold pill page indicator, and
+/// double tap = like with a heart that blooms and fades (§2.4).
+class PostMediaCarousel extends StatefulWidget {
+  const PostMediaCarousel({
+    required this.media,
+    required this.onDoubleTap,
+    required this.semanticLabel,
+    this.compact = false,
+    this.fill = false,
+    this.onTap,
+    super.key,
+  });
+
+  /// Tap on photo `index` (the open post shows the full-screen gallery).
+  final void Function(int index)? onTap;
+
+  final List<PostMedia> media;
+  final VoidCallback onDoubleTap;
+  final String semanticLabel;
+
+  /// Owner 2026-09-30: in the feed a whole card must fit on one screen, so
+  /// the photo is a wide 2:1 band (cropped); the opened post keeps the
+  /// photo's own aspect ratio.
+  final bool compact;
+
+  /// Fill the parent box (the feed card sizes it) instead of keeping a
+  /// ratio.
+  final bool fill;
+
+  @override
+  State<PostMediaCarousel> createState() => _PostMediaCarouselState();
+}
+
+class _PostMediaCarouselState extends State<PostMediaCarousel>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _heart = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 820),
+  );
+  final _page = ValueNotifier<int>(0);
+
+  @override
+  void dispose() {
+    _heart.dispose();
+    _page.dispose();
+    super.dispose();
+  }
+
+  void _doubleTap() {
+    HapticFeedback.lightImpact();
+    widget.onDoubleTap();
+    if (!context.reduceMotion) _heart.forward(from: 0);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final media = widget.media;
+    final Widget gallery = GestureDetector(
+      onDoubleTap: _doubleTap,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          PageView.builder(
+            itemCount: media.length,
+            onPageChanged: (i) => _page.value = i,
+            // Owner 2026-09-30: the whole photo is always visible — shown
+            // "contain" over a blurred copy of itself filling the frame
+            // (no half-cropped portraits). Tap in the open post = full
+            // screen gallery.
+            itemBuilder: (context, i) {
+              final m = media[i];
+              Widget img(BoxFit fit, String url, String key) =>
+                  CachedNetworkImage(
+                    imageUrl: url,
+                    cacheKey: key,
+                    fit: fit,
+                    fadeInDuration: context.reduceMotion
+                        ? Duration.zero
+                        : AppMotion.stateChange,
+                    placeholder: (_, __) =>
+                        ColoredBox(color: colors.skeletonBase),
+                    errorWidget: (_, __, ___) => ColoredBox(
+                      color: colors.skeletonBase,
+                      child: AppIcon(
+                        AppIcons.imageNotSupportedOutlined,
+                        color: colors.textSecondary,
+                      ),
+                    ),
+                  );
+              return GestureDetector(
+                onTap: widget.onTap == null ? null : () => widget.onTap!(i),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    ImageFiltered(
+                      imageFilter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+                      child: img(BoxFit.cover, m.previewUrl, '${m.fileId}:320'),
+                    ),
+                    ColoredBox(color: Colors.black.withValues(alpha: 0.18)),
+                    img(BoxFit.contain, m.mediumUrl, '${m.fileId}:1080'),
+                  ],
+                ),
+              );
+            },
+          ),
+          IgnorePointer(child: _HeartBurst(animation: _heart)),
+          if (media.length > 1)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: AppSpacing.md,
+              child: IgnorePointer(
+                child: ValueListenableBuilder<int>(
+                  valueListenable: _page,
+                  builder: (context, page, _) =>
+                      _Dots(count: media.length, index: page),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+    return Semantics(
+      label: widget.semanticLabel,
+      // In fill mode the parent (the feed card) decides the size.
+      child: widget.fill
+          ? gallery
+          : AspectRatio(
+              aspectRatio: widget.compact ? 2 : media.first.aspectRatio,
+              child: gallery,
+            ),
+    );
+  }
+}
+
+/// Double tap on the whole post = like (never unlike, like Instagram) with
+/// the heart bursting in the middle of the card.
+class DoubleTapLike extends StatefulWidget {
+  const DoubleTapLike({required this.onLike, required this.child, super.key});
+
+  final VoidCallback onLike;
+  final Widget child;
+
+  @override
+  State<DoubleTapLike> createState() => _DoubleTapLikeState();
+}
+
+class _DoubleTapLikeState extends State<DoubleTapLike>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _heart = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 820),
+  );
+
+  @override
+  void dispose() {
+    _heart.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onDoubleTap: () {
+          HapticFeedback.lightImpact();
+          widget.onLike();
+          if (!context.reduceMotion) _heart.forward(from: 0);
+        },
+        child: Stack(
+          children: [
+            widget.child,
+            Positioned.fill(
+              child: IgnorePointer(child: _HeartBurst(animation: _heart)),
+            ),
+          ],
+        ),
+      );
+}
+
+class _HeartBurst extends StatelessWidget {
+  const _HeartBurst({required this.animation});
+
+  final Animation<double> animation;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    return AnimatedBuilder(
+      animation: animation,
+      builder: (context, _) {
+        final v = animation.value;
+        if (v == 0 || v == 1) return const SizedBox.shrink();
+        // Bloom (0–35%), hold, fade (70–100%).
+        final scale = v < 0.35
+            ? Curves.easeOutBack.transform(v / 0.35) * 1.1
+            : 1.1 - 0.1 * ((v - 0.35) / 0.65).clamp(0, 1);
+        final opacity = v < 0.7 ? 1.0 : 1 - (v - 0.7) / 0.3;
+        return Center(
+          child: Opacity(
+            opacity: opacity.clamp(0, 1),
+            child: Transform.scale(
+              scale: scale,
+              child: AppIcon(
+                AppIcons.favoriteRounded,
+                size: 108,
+                color: Colors.white,
+                shadows: [
+                  Shadow(
+                    color: colors.gold.withValues(alpha: 0.6),
+                    blurRadius: 28,
+                  ),
+                  Shadow(color: colors.shadow, blurRadius: 12),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _Dots extends StatelessWidget {
+  const _Dots({required this.count, required this.index});
+
+  final int count;
+  final int index;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        for (var i = 0; i < count; i++)
+          AnimatedContainer(
+            duration:
+                context.reduceMotion ? Duration.zero : AppMotion.stateChange,
+            curve: AppMotion.enterCurve,
+            margin: const EdgeInsets.symmetric(horizontal: 3),
+            width: i == index ? 18 : 6,
+            height: 6,
+            decoration: BoxDecoration(
+              color: i == index
+                  ? colors.gold
+                  : Colors.white.withValues(alpha: 0.7),
+              borderRadius: BorderRadius.circular(AppRadii.pill),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _ActionsBar extends ConsumerWidget {
+  const _ActionsBar({
+    required this.post,
+    required this.run,
+    this.showTime = false,
+    this.showCounts = true,
+    this.boost = true,
+  });
+
+  /// Owner 2026-10-07: «Продвигать» only on the cards in a list, never
+  /// inside the open post.
+  final bool boost;
+
+  /// Owner 2026-10-06: Instagram-style posts show bare icons; the likes
+  /// count sits on its own line below.
+  final bool showCounts;
+
+  final Post post;
+  final Future<void> Function(Future<Object?> Function()) run;
+
+  /// Feed card: "56 min ago · Public" left of the Save button.
+  final bool showTime;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ref.watch(translatorProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final actions = ref.read(socialActionsProvider);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+      child: Row(
+        children: [
+          BounceIcon(
+            active: post.likedByMe,
+            activeIcon: AppIcons.favoriteRounded,
+            icon: AppIcons.favoriteBorderRounded,
+            activeColor: colors.danger,
+            label: t.t(post.likedByMe ? 'post.unlike' : 'post.like'),
+            onTap: () => run(() => actions.toggleLike(post)),
+          ),
+          // Owner 2026-09-30 design: counts next to the icons.
+          if (showCounts && post.likeCount > 0) _Count(post.likeCount),
+          BounceIcon(
+            active: false,
+            activeIcon: AppIcons.modeCommentOutlined,
+            icon: AppIcons.modeCommentOutlined,
+            label: t.t('post.comments'),
+            onTap: () => showCommentsSheet(
+              context,
+              postId: post.id,
+              commentsEnabled: post.commentsEnabled,
+            ),
+          ),
+          if (showCounts && post.commentCount > 0) _Count(post.commentCount),
+          BounceIcon(
+            active: false,
+            activeIcon: AppIcons.sendOutlined,
+            icon: AppIcons.sendOutlined,
+            label: t.t('post.share'),
+            onTap: () => sharePost(context, ref, post),
+          ),
+          if (showCounts && post.shareCount > 0) _Count(post.shareCount),
+          // Owner 2026-09-30: the time and Save sit at the right edge.
+          Expanded(
+            child: showTime
+                ? Align(
+                    alignment: AlignmentDirectional.centerEnd,
+                    child: _TimeLine(post: post, inline: true),
+                  )
+                // Owner 2026-10-07: «Продвигать» / «Boost» under my own
+                // post, right before Save; it may use all the free width.
+                : boost && post.isMine && !ref.watch(isAssistantProvider)
+                    ? Align(
+                        alignment: AlignmentDirectional.centerEnd,
+                        child: BoostButton(postId: post.id),
+                      )
+                    : const SizedBox.shrink(),
+          ),
+          BounceIcon(
+            active: post.savedByMe,
+            activeIcon: AppIcons.bookmarkRounded,
+            icon: AppIcons.bookmarkBorderRounded,
+            activeColor: colors.gold,
+            label: t.t(post.savedByMe ? 'post.unsave' : 'post.save'),
+            onTap: () => run(() => actions.toggleSave(post)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Count extends ConsumerWidget {
+  const _Count(this.value);
+
+  final int value;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final f = ref.watch(l10nFormatsProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final type = Theme.of(context).extension<AppTypographyTokens>()!;
+    return Padding(
+      padding: const EdgeInsetsDirectional.only(end: AppSpacing.sm),
+      child: Text(
+        SocialFormat.count(f, value),
+        style:
+            type.body.copyWith(color: colors.text, fontWeight: FontWeight.w500),
+      ),
+    );
+  }
+}
+
+/// A 48x48 action icon that pops (1 → 1.28 → 1) when it turns active.
+class BounceIcon extends StatefulWidget {
+  const BounceIcon({
+    required this.active,
+    required this.icon,
+    required this.activeIcon,
+    required this.label,
+    required this.onTap,
+    this.activeColor,
+    this.size = 26,
+    super.key,
+  });
+
+  final bool active;
+  final IconData icon;
+  final IconData activeIcon;
+  final String label;
+  final VoidCallback onTap;
+  final Color? activeColor;
+  final double size;
+
+  @override
+  State<BounceIcon> createState() => _BounceIconState();
+}
+
+class _BounceIconState extends State<BounceIcon>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 360),
+  );
+  late final Animation<double> _scale = TweenSequence<double>([
+    TweenSequenceItem(tween: Tween<double>(begin: 1, end: 1.28), weight: 40),
+    TweenSequenceItem(
+      tween: Tween<double>(begin: 1.28, end: 1)
+          .chain(CurveTween(curve: Curves.elasticOut)),
+      weight: 60,
+    ),
+  ]).animate(_c);
+
+  @override
+  void didUpdateWidget(BounceIcon old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active && !context.reduceMotion) {
+      _c.forward(from: 0);
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    return Semantics(
+      button: true,
+      toggled: widget.icon == widget.activeIcon ? null : widget.active,
+      label: widget.label,
+      excludeSemantics: true,
+      child: AppTapTarget(
+        child: AppPressable(
+          onTap: () {
+            HapticFeedback.selectionClick();
+            widget.onTap();
+          },
+          child: SizedBox.square(
+            dimension: AppSizes.touchTarget,
+            child: Center(
+              child: ScaleTransition(
+                scale: _scale,
+                child: AnimatedSwitcher(
+                  duration: context.reduceMotion
+                      ? Duration.zero
+                      : const Duration(milliseconds: 160),
+                  transitionBuilder: (child, a) =>
+                      FadeTransition(opacity: a, child: child),
+                  child: AppIcon(
+                    widget.active ? widget.activeIcon : widget.icon,
+                    key: ValueKey(widget.active),
+                    size: widget.size,
+                    color: widget.active
+                        ? (widget.activeColor ?? colors.text)
+                        : colors.text,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Skeleton of a post card (loading state).
+class PostCardSkeleton extends StatelessWidget {
+  const PostCardSkeleton({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    return Container(
+      decoration: BoxDecoration(
+        color: colors.surface,
+        borderRadius: BorderRadius.circular(AppRadii.card),
+        border: Border.all(color: colors.border),
+      ),
+      padding: const EdgeInsets.all(AppSpacing.lg),
+      child: const Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              AppSkeleton(
+                width: AppSizes.cardAvatar,
+                height: AppSizes.cardAvatar,
+                borderRadius: AppRadii.pill,
+              ),
+              SizedBox(width: AppSpacing.md),
+              Expanded(child: AppSkeleton()),
+            ],
+          ),
+          SizedBox(height: AppSpacing.lg),
+          AspectRatio(
+            aspectRatio: 1,
+            child: AppSkeleton(borderRadius: AppRadii.card),
+          ),
+          SizedBox(height: AppSpacing.lg),
+          AppSkeleton(width: 160),
+          SizedBox(height: AppSpacing.sm),
+          AppSkeleton(),
+        ],
+      ),
+    );
+  }
+}
+
+/// The disclaimer under the composer and on the post screen (§2.4).
+class PostDisclaimer extends ConsumerWidget {
+  const PostDisclaimer({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final t = ref.watch(translatorProvider);
+    final colors = Theme.of(context).extension<AppColorTokens>()!;
+    final type = Theme.of(context).extension<AppTypographyTokens>()!;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        AppIcon(
+          AppIcons.infoOutlineRounded,
+          size: AppSizes.iconSm,
+          color: colors.textSecondary,
+        ),
+        const SizedBox(width: AppSpacing.sm),
+        Expanded(
+          child: Text(
+            t.t('post.disclaimer'),
+            style: type.caption.copyWith(color: colors.textSecondary),
+          ),
+        ),
+      ],
+    );
+  }
+}

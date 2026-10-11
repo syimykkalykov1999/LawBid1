@@ -1,0 +1,81 @@
+// coverage:ignore-file
+// GENERATED CODE - DO NOT MODIFY BY HAND
+// ignore_for_file: type=lint, unused_import, invalid_annotation_target, unnecessary_import
+
+import 'package:json_annotation/json_annotation.dart';
+
+import 'bid_attorney_summary_dto.dart';
+import 'bid_case_ref_dto.dart';
+import 'bid_offer_dto.dart';
+import 'bid_status.dart';
+import 'fee_type.dart';
+import 'party_role.dart';
+import 'start_availability.dart';
+
+part 'my_bid_item_dto.g.dart';
+
+@JsonSerializable()
+class MyBidItemDto {
+  const MyBidItemDto({
+    required this.id,
+    required this.caseId,
+    required this.attorneyId,
+    required this.status,
+    required this.feeType,
+    required this.amountCents,
+    required this.message,
+    required this.startAvailability,
+    required this.startDate,
+    required this.estimatedDurationDays,
+    required this.roundCount,
+    required this.turn,
+    required this.decidedAt,
+    required this.outsidePractice,
+    required this.outsideLicensedStates,
+    required this.createdAt,
+    required this.caseValue,
+    required this.lastOffer,
+    this.attorney,
+    this.coverUrl,
+  });
+
+  factory MyBidItemDto.fromJson(Map<String, Object?> json) =>
+      _$MyBidItemDtoFromJson(json);
+
+  final String id;
+  final String caseId;
+  final String attorneyId;
+  final BidStatus status;
+  final FeeType feeType;
+  final int amountCents;
+  final String message;
+  final StartAvailability startAvailability;
+  final DateTime? startDate;
+  final int? estimatedDurationDays;
+  final int roundCount;
+  final PartyRole turn;
+  final DateTime? decidedAt;
+
+  /// Owner 2026-09-30: the case's practice is outside the attorney's.
+  /// own — the client is told to discuss it first.
+  final bool outsidePractice;
+
+  /// Owner 2026-10-04: the attorney holds no verified licence in the.
+  /// case's states — bidding is allowed, the client is told.
+  final bool outsideLicensedStates;
+  final DateTime createdAt;
+
+  /// The attorney summary — only on GET /bids/:id.
+  final BidAttorneySummaryDto? attorney;
+
+  /// The name has been replaced because it contains a keyword. Original name: `case`.
+  @JsonKey(name: 'case')
+  final BidCaseRefDto caseValue;
+  final BidOfferDto lastOffer;
+
+  /// Owner 2026-09-30: the case's first photo once this bid is accepted,.
+  /// else null (the app shows the qualification's art).
+  final String? coverUrl;
+
+  Map<String, Object?> toJson() => _$MyBidItemDtoToJson(this);
+}

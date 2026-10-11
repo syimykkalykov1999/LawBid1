@@ -1,0 +1,174 @@
+import 'dart:async';
+
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:lawbid/core/navigation/app_router.dart';
+import 'package:lawbid/features/calls/application/call_controller.dart';
+import 'package:lawbid/features/calls/application/callkit_bridge.dart';
+import 'package:lawbid/features/chat/application/chat_providers.dart';
+import 'package:lawbid/features/notifications/application/notifications_providers.dart';
+import 'package:lawbid/features/notifications/presentation/notifications_view.dart';
+import 'package:lawbid/features/onboarding/application/current_user_controller.dart';
+import 'package:lawbid/features/social/application/social_providers.dart';
+import 'package:lawbid/shared/domain/user_role.dart';
+
+/// docs/05 §9.5 push on the device: FCM token registered for this session
+/// (`POST /push-tokens`), re-registered when it rotates, removed on
+/// sign-out; tapping a push opens its screen. Without Firebase config
+/// files (dev builds, docs/KEYS_SETUP.md) this quietly does nothing.
+class PushService {
+  PushService(this._ref);
+
+  final Ref _ref;
+  String? _token;
+
+  /// The user this device is registered for; a different sign-in
+  /// registers again (review: user B after user A got no pushes).
+  String? _startedFor;
+  final _subs = <StreamSubscription<Object?>>[];
+
+  Future<void> start() async {
+    final user = _ref.read(currentUserIdProvider);
+    if (user == null || _startedFor == user) return;
+    _startedFor = user;
+    for (final s in _subs) {
+      await s.cancel();
+    }
+    _subs.clear();
+    try {
+      if (Firebase.apps.isEmpty) await Firebase.initializeApp();
+    } on Object catch (e) {
+      debugPrint('push disabled: $e');
+      _startedFor = null;
+      return;
+    }
+    // docs/01 §11 Шаг 3: the onboarding explainer asked first; a user who
+    // said no there is not prompted by the OS at every start (Settings →
+    // Notifications re-asks explicitly).
+    final optIn = _ref
+        .read(currentUserControllerProvider)
+        .user
+        ?.onboarding
+        .data['pushOptIn'];
+    if (optIn == false) {
+      debugPrint('push: declined in onboarding, not prompting');
+      return;
+    }
+    final m = FirebaseMessaging.instance;
+    try {
+      // OQ-041: a call pushed while the app is in the background rings
+      // through the system call screen.
+      FirebaseMessaging.onBackgroundMessage(lawbidBackgroundMessage);
+      await m.requestPermission();
+      final token = await m.getToken();
+      if (token != null) await _register(token);
+      _subs
+        ..add(m.onTokenRefresh.listen(_register))
+        ..add(FirebaseMessaging.onMessageOpenedApp.listen(_open))
+        // A push in the foreground: realtime already updated the screen;
+        // just refresh the badge.
+        ..add(
+          FirebaseMessaging.onMessage.listen((msg) {
+            // OQ-041: the socket may have missed the ring.
+            if (msg.data['type'] == 'incoming_call' &&
+                msg.data['callId'] is String) {
+              unawaited(
+                _ref
+                    .read(callControllerProvider.notifier)
+                    .ringFromPush(msg.data['callId'] as String),
+              );
+              return;
+            }
+            _ref.read(badgesProvider.notifier).refresh();
+          }),
+        );
+      final initial = await m.getInitialMessage();
+      if (initial != null) _open(initial);
+    } on Object catch (e) {
+      debugPrint('push setup failed: $e');
+      _startedFor = null; // try again on the next shell start
+    }
+  }
+
+  Future<void> _register(String token) async {
+    _token = token;
+    try {
+      await _ref.read(notificationsRepositoryProvider).registerPushToken(
+            token,
+            ios: defaultTargetPlatform == TargetPlatform.iOS,
+          );
+    } on Object {
+      // Next app start registers again.
+    }
+  }
+
+  /// Sign-out: this device stops receiving pushes.
+  Future<void> unregister() async {
+    _startedFor = null;
+    final token = _token;
+    if (token == null) return;
+    try {
+      await _ref.read(notificationsRepositoryProvider).deletePushToken(token);
+    } on Object {
+      // The server also drops tokens of signed-out sessions.
+    }
+  }
+
+  void _open(RemoteMessage message) {
+    final data = message.data;
+    if (data['type'] == 'incoming_call' && data['callId'] is String) {
+      unawaited(
+        _ref
+            .read(callControllerProvider.notifier)
+            .ringFromPush(data['callId'] as String),
+      );
+      return;
+    }
+    // Audit 2026-10-04: opening a push reads its notification.
+    final id = data['notificationId'];
+    if (id is String) unawaited(_markRead(id));
+    final route = notificationRoute(
+      type: '${data['type'] ?? ''}',
+      payload: Map<String, Object?>.from(data),
+      attorney: _ref.read(currentUserRoleProvider) == UserRole.attorney,
+      myId: _ref.read(currentUserIdProvider),
+    );
+    if (route != null) unawaited(_ref.read(appRouterProvider).push(route));
+  }
+
+  Future<void> _markRead(String id) async {
+    try {
+      await _ref.read(notificationsRepositoryProvider).markRead(ids: [id]);
+      _ref.invalidate(notificationsProvider);
+    } on Object {
+      // The row stays unread; a tap in the list reads it.
+    }
+    unawaited(_ref.read(badgesProvider.notifier).refresh());
+  }
+
+  void dispose() {
+    for (final s in _subs) {
+      s.cancel();
+    }
+  }
+}
+
+final pushServiceProvider = Provider<PushService>((ref) {
+  final service = PushService(ref);
+  ref.onDispose(service.dispose);
+  return service;
+});
+
+/// Per sign-in start-up work: push registration and the outbox drain.
+/// Re-runs when the user changes (MainShell listens to it, so it never
+/// runs from a widget's build).
+final sessionServicesProvider = Provider<void>((ref) {
+  final user = ref.watch(currentUserIdProvider);
+  if (user == null) return;
+  Future.microtask(() {
+    ref.read(pushServiceProvider).start();
+    ref.read(outboxSenderProvider).drain();
+  });
+});

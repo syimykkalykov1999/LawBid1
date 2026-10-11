@@ -1,0 +1,188 @@
+name: lawbid
+description: "LawBid — доска объявлений для клиентов и адвокатов (US legal-services marketplace)."
+publish_to: "none"
+# 1.0.0 = version users see (raise by hand for a release).
+# +1 = automatic build number: release builds replace it with the minutes
+# since 2026-01-01 UTC (android/app/build.gradle.kts, iOS build phase
+# "Auto build number"), so every store upload is higher on its own.
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # State management (file 01 §5.1)
+  flutter_riverpod: ^3.4.3
+  riverpod_annotation: ^4.0.7
+
+  # Navigation — StatefulShellRoute.indexedStack (file 01 §5.1 names "go_router с ShellRoute";
+  # this is the modern variant that preserves each tab's own Navigator stack, chosen per
+  # stage 1.5 architecture review — see docs/CHANGELOG.md stage 1.5 entry)
+  go_router: ^14.6.2
+
+  # Models (stage 1.5 doesn't define any yet; locked in now so stage 1.7+ doesn't fight
+  # version skew across the monorepo)
+  freezed_annotation: ^3.1.0
+  json_annotation: ^4.12.0
+
+  # Local key-value persistence (theme mode now; auth/session/feature-flags in later stages,
+  # all behind the same repository-interface pattern — see LocalKvStore)
+  shared_preferences: ^2.3.3
+
+  # Networking (real backend wiring pass, docs/CHANGELOG.md): dio for the
+  # HTTP client + interceptors (headers/auth/refresh), flutter_secure_storage
+  # for the refresh token only (see core/session/token_secure_store.dart's
+  # doc comment for why it's not in LocalKvStore/SharedPreferences).
+  dio: ^5.9.0
+  flutter_secure_storage: ^9.2.4
+
+  # Social login (Phase 3 of the auth networking work, docs/CHANGELOG.md):
+  # native Apple/Google sign-in SDKs, exchanged against the already-live
+  # `POST /auth/social` backend endpoint. `crypto` is only for the SHA-256
+  # hash Apple's nonce verification needs — see
+  # features/auth/data/social_auth_native_client.dart's doc comment for
+  # the exact contract (Apple wants a hashed nonce, Google wants the raw
+  # one — see that file's `TODO(nonce-verify)` on the google_sign_in side).
+  sign_in_with_apple: ^6.1.4
+  google_sign_in: ^7.2.0
+  crypto: ^3.0.6
+
+  # Biometric reauth (Phase 4 of the auth networking work, docs/CHANGELOG.md):
+  # local Face ID/Touch ID/fingerprint gate (file 01 §10.1) used as a local
+  # device-owner check ahead of the phone+OTP step that actually mints a
+  # `POST /auth/reauth` token server-side — see
+  # core/session/biometric_auth_service.dart's doc comment for why the
+  # server-side trust boundary is still OTP-only this stage.
+  local_auth: ^2.3.0
+
+  # Local SQLite cache for the real, backend-driven L10n layer (file 01
+  # §9.4, stage 1.6 — see core/l10n/l10n_database.dart). `drift_flutter`
+  # supplies `driftDatabase()`, the standard cross-platform (native +
+  # sqlite3_flutter_libs under the hood, web via wasm) connection opener
+  # for a Flutter app — no separate sqlite3_flutter_libs/path_provider
+  # dependency needed, drift_flutter pulls those in itself.
+  drift: ^2.23.0
+  drift_flutter: ^0.3.1
+
+  # CLDR plural rules + date/number/currency formatting per interface
+  # language (file 01 §9.2/§9.4 — core/l10n/plural_rules.dart,
+  # core/l10n/l10n_formats.dart). Already in the lockfile transitively.
+  intl: ^0.20.2
+  flutter_animate: ^4.5.2
+  # p12 leaf-1.4 (mobile platform): real installed version for
+  # X-App-Version; deep links (custom scheme + universal/App Links, file 01
+  # §12); opening the store from the update prompts; Android SMS Retriever
+  # OTP autofill (file 01 §10.2 D).
+  package_info_plus: ^9.0.1
+  app_links: ^7.2.1
+  url_launcher: ^6.3.2
+  smart_auth: ^3.2.0
+  # Connectivity (docs/01 §8.3 "Offline (баннер сверху, показ кэша)",
+  # p12 leaf-1.6): the OS network-interface signal behind
+  # core/connectivity/connectivity_service.dart. It only says whether an
+  # interface is up; real reachability comes from dio network errors
+  # (ReachabilityInterceptor) and a /health/live probe.
+  connectivity_plus: ^7.3.1
+  # Generated API client (docs/01 §6.3, p12 leaf-1.3): models + retrofit
+  # clients from packages/api-contract/openapi.json — regenerate with
+  # packages/api-contract/generate.sh, never hand-edit.
+  lawbid_api:
+    path: ../../packages/api-contract/dart
+  # docs/03 §4.1 profile photo (stage 3.9, OQ-012): gallery/camera pick,
+  # downscaled to 1024 px before the presign → S3 POST → confirm upload.
+  image_picker: ^1.2.3
+  camera: ^0.12.1
+  file_picker: ^11.0.3
+  share_plus: ^12.0.2
+  socket_io_client: ^3.1.6
+  cached_network_image: ^4.0.2
+  firebase_core: ^4.15.0
+  firebase_messaging: ^16.7.0
+  app_badge_plus: ^1.3.5
+  flutter_timezone: ^5.1.0
+  flutter_stripe: ^14.1.0
+  record: ^7.1.1
+  just_audio: ^0.10.6
+  path_provider: ^2.1.6
+  flutter_webrtc: ^1.6.2+hotfix.3
+  # Owner 2026-10-05 (docs/ops/demo-world.md): Android Play Install Referrer —
+  # `lawbid_ref=<CODE>` from the store link becomes the pending referral
+  # code applied once after onboarding (features/referrals/application/
+  # install_referrer.dart). MIT. NOTE: pub.dev marks 0.4.0 (Apr 2024) as the
+  # final release and points to `play_install_referrer` (same API, class
+  # `PlayInstallReferrer`) as its successor — swap when convenient.
+  android_play_install_referrer: ^0.4.0
+  flutter_callkit_incoming: ^3.1.6
+  font_awesome_flutter: ^11.0.0
+  video_player: ^2.14.0
+  visibility_detector: ^0.4.0+2
+  audio_session: ^0.2.4
+  video_compress: ^3.1.4
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  riverpod_generator: ^4.0.9
+  build_runner: ^2.16.1
+  freezed: ^4.0.2
+  json_serializable: ^6.14.1
+  # Codegen for the `@DriftDatabase` table classes in
+  # core/l10n/l10n_database.dart — same `dart run build_runner build` pass
+  # as riverpod_generator/freezed/json_serializable above.
+  drift_dev: ^2.23.0
+  # custom_lint / riverpod_lint: TEMPORARILY REMOVED — 2026-09-22, UPDATE 2026-09-22.
+  # Original reason: custom_lint ^0.7.x pulled analyzer_plugin ~0.12.0, which broke against
+  # the analyzer version resolved elsewhere in the graph (Element -> Element2 migration),
+  # failing `dart run build_runner build` entirely.
+  # Update: the app's whole Riverpod 2->3 / Freezed 2->4 migration (see CHANGELOG, same date)
+  # already happened to fix the build, so custom_lint 0.8.1 + riverpod_lint ^3.x (which need
+  # riverpod 3.x) are now compatible with this pubspec — no longer blocked. Not re-added here
+  # anyway, to keep this pass scoped to "unblock the build"; re-adding IDE-lint-only tooling
+  # is a separate, deliberate decision, not a version-conflict problem anymore. See CHANGELOG.
+  very_good_analysis: ^6.0.0
+  golden_toolkit: ^0.15.0
+
+flutter:
+  uses-material-design: true
+  # Plain `flutter run` / `flutter build` without --flavor builds the dev
+  # variant ("LawBid Dev", lib/main.dart = dev) — p12 leaf-1.4 flavors.
+  default-flavor: dev
+
+  assets:
+    - assets/fonts/OFL-SourceSerif4.txt
+    - assets/fonts/OFL-Inter.txt
+    - assets/practice_art/
+    - assets/demo/
+    # OQ-041/044: call tones and in-app message sounds.
+    - assets/sounds/
+
+  fonts:
+    # Owner 2026-10-01: Phosphor icons (MIT, assets/fonts/LICENSE-Phosphor.txt).
+    - family: PhosphorLight
+      fonts:
+        - asset: assets/fonts/PhosphorLight.ttf
+    - family: PhosphorFill
+      fonts:
+        - asset: assets/fonts/PhosphorFill.ttf
+    - family: Source Serif 4
+      fonts:
+        - asset: assets/fonts/SourceSerif4-Variable.ttf
+          weight: 600
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Variable.ttf
+          weight: 400
+        - asset: assets/fonts/Inter-Variable.ttf
+          weight: 500
+        - asset: assets/fonts/Inter-Variable.ttf
+          weight: 600
+
+dependency_overrides:
+  # Riverpod bumped 2.x -> 3.x on 2026-09-22 specifically to escape this: riverpod_generator
+  # 2.x's analyzer-touching chain (riverpod_analyzer_utils, custom_lint_core, analyzer_plugin)
+  # was never updated for analyzer's Element -> Element2 migration and cannot build against any
+  # analyzer version the current Dart SDK accepts. 3.x/4.x generations fix this. No overrides
+  # needed after the bump; keeping this file present as a documented marker.

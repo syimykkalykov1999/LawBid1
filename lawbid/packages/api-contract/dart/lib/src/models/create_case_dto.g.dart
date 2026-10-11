@@ -1,0 +1,53 @@
+// GENERATED CODE - DO NOT MODIFY BY HAND
+
+part of 'create_case_dto.dart';
+
+// **************************************************************************
+// JsonSerializableGenerator
+// **************************************************************************
+
+CreateCaseDto _$CreateCaseDtoFromJson(Map<String, dynamic> json) =>
+    CreateCaseDto(
+      practiceAreaId: json['practiceAreaId'] as String,
+      title: json['title'] as String,
+      description: json['description'] as String,
+      primaryStateCode: json['primaryStateCode'] as String,
+      budgetMode: BudgetMode.fromJson(json['budgetMode'] as String),
+      additionalStateCodes: (json['additionalStateCodes'] as List<dynamic>?)
+          ?.map((e) => e as String)
+          .toList(),
+      city: json['city'] as String?,
+      photoFileIds: (json['photoFileIds'] as List<dynamic>?)
+          ?.map((e) => e as String)
+          .toList(),
+      budgetAmountDollars: (json['budgetAmountDollars'] as num?)?.toInt(),
+      clientContactSharingConsent: json['clientContactSharingConsent'] as bool?,
+      coverKey: json['coverKey'] as String?,
+      urgency: json['urgency'] == null
+          ? null
+          : CaseUrgency.fromJson(json['urgency'] as String),
+      deadlineAt: json['deadlineAt'] == null
+          ? null
+          : DateTime.parse(json['deadlineAt'] as String),
+      deadlineKind: json['deadlineKind'] == null
+          ? null
+          : CaseDeadlineKind.fromJson(json['deadlineKind'] as String),
+    );
+
+Map<String, dynamic> _$CreateCaseDtoToJson(CreateCaseDto instance) =>
+    <String, dynamic>{
+      'practiceAreaId': instance.practiceAreaId,
+      'title': instance.title,
+      'description': instance.description,
+      'primaryStateCode': instance.primaryStateCode,
+      'additionalStateCodes': ?instance.additionalStateCodes,
+      'city': ?instance.city,
+      'budgetMode': instance.budgetMode.toJson(),
+      'photoFileIds': ?instance.photoFileIds,
+      'budgetAmountDollars': ?instance.budgetAmountDollars,
+      'clientContactSharingConsent': ?instance.clientContactSharingConsent,
+      'coverKey': ?instance.coverKey,
+      'urgency': ?instance.urgency?.toJson(),
+      'deadlineAt': ?instance.deadlineAt?.toIso8601String(),
+      'deadlineKind': ?instance.deadlineKind?.toJson(),
+    };

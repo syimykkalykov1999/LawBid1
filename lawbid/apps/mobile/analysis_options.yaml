@@ -1,0 +1,30 @@
+include: package:very_good_analysis/analysis_options.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  # `plugins: - custom_lint` removed 2026-09-27: custom_lint is not a
+  # dependency any more (see pubspec.yaml note) and the legacy analyzer-
+  # plugin config itself is deprecated (analysis_options_deprecated_plugins).
+  errors:
+    invalid_annotation_target: ignore # standard freezed/json_serializable false positive
+  exclude:
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+
+linter:
+  rules:
+    public_member_api_docs: false
+    # pubspec.yaml groups its dependencies with explanatory comments, not A→Z.
+    sort_pub_dependencies: false
+
+# Audit 2026-10-02: keep the trailing commas the `require_trailing_commas`
+# lint asks for (dart format would otherwise strip them again).
+formatter:
+  trailing_commas: preserve

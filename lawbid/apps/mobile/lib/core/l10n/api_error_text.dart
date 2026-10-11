@@ -1,0 +1,248 @@
+import 'package:lawbid/core/l10n/translator.dart';
+import 'package:lawbid/core/network/api_error.dart';
+
+/// Localized, user-facing text for an [ApiException] — docs/01_FOUNDATION_
+/// AUTH.md §7: "Клиент показывает локализованный текст по `code`, а не по
+/// `message`". Every code a user can run into has a key (en+ru,
+/// static_translator.dart + translations seed) — mostly `error.api.<CODE>`,
+/// several codes may share one text; codes that never reach a screen
+/// (TOKEN_EXPIRED -> silent refresh, APP_UPDATE_REQUIRED -> forced-update
+/// screen, INTERNAL_ERROR, ...) fall back to the generic message.
+String apiErrorText(Translator t, ApiException error) {
+  final key = _keys[error.code];
+  if (key == null) return t.t('error.default.message');
+  if (error.code == ApiErrorCodes.authOtpRequestLimit ||
+      error.code == ApiErrorCodes.rateLimited) {
+    final retry = error.details?['retryAfterSeconds'];
+    if (retry is int && retry > 0) {
+      return t.t('error.api.retryAfter', {'seconds': '$retry'});
+    }
+  }
+  // docs/03 §4.1 / OQ-012: say which requirement blocks completion when
+  // it is the attorney photo.
+  if (error.code == ApiErrorCodes.onboardingIncomplete) {
+    final missing = error.details?['missing'];
+    if (missing is List && missing.contains('photo')) {
+      return t.t('onboarding.profile.error.photoRequired');
+    }
+  }
+  // The cost guard's phone check says *why* a +1 number was refused
+  // (apps/api modules/auth/dto/validators.ts checkSmsDestination): a non-existent US number, a
+  // non-mobile/premium line, or a non-US +1 country (Canada, Caribbean).
+  if (error.code == ApiErrorCodes.phoneCountryNotSupported) {
+    final reason = error.details?['reason'];
+    if (reason == 'invalid') return t.t('error.api.PHONE_INVALID_US');
+    if (reason == 'number_type_not_allowed') {
+      return t.t('error.api.PHONE_TYPE_NOT_ALLOWED');
+    }
+    if (reason == 'country_not_allowed') {
+      return t.t('error.api.COUNTRY_NOT_AVAILABLE');
+    }
+  }
+  // Owner 2026-10-05: attorney trust — name the requirements the gate is
+  // missing ({gate, missing: [registry|identity|documents], current}).
+  if (error.code == ApiErrorCodes.trustLevelRequired) {
+    final missing = error.details?['missing'];
+    if (missing is List && missing.isNotEmpty) {
+      const known = {'registry', 'identity', 'documents'};
+      final names = [
+        for (final m in missing)
+          if (m is String && known.contains(m)) t.t('trust.req.$m'),
+      ];
+      if (names.isNotEmpty) {
+        return t.t(key, {'missing': names.join(', ')});
+      }
+    }
+    return t.t('error.api.TRUST_LEVEL_REQUIRED.plain');
+  }
+  return t.t(key);
+}
+
+/// Same as [apiErrorText] for an arbitrary thrown object.
+String errorText(Translator t, Object error) => error is ApiException
+    ? apiErrorText(t, error)
+    : t.t('error.default.message');
+
+bool isOfflineError(Object? error) =>
+    error is ApiException && error.isNetworkError;
+
+const _keys = <String, String>{
+  ApiException.networkErrorCode: 'error.api.NETWORK_ERROR',
+  ApiErrorCodes.validationError: 'error.api.VALIDATION_ERROR',
+  ApiErrorCodes.rateLimited: 'error.api.RATE_LIMITED',
+  ApiErrorCodes.authOtpInvalid: 'error.api.AUTH_OTP_INVALID',
+  ApiErrorCodes.authOtpExpired: 'error.api.AUTH_OTP_EXPIRED',
+  ApiErrorCodes.authOtpLocked: 'error.api.AUTH_OTP_LOCKED',
+  ApiErrorCodes.authOtpRequestLimit: 'error.api.AUTH_OTP_REQUEST_LIMIT',
+  ApiErrorCodes.contactDomainBlocked: 'error.api.CONTACT_DOMAIN_BLOCKED',
+  ApiErrorCodes.contactAlreadyExists: 'error.api.CONTACT_ALREADY_EXISTS',
+  ApiErrorCodes.identifierAlreadyLinked: 'error.api.CONTACT_ALREADY_EXISTS',
+  ApiErrorCodes.phoneCountryNotSupported:
+      'error.api.PHONE_COUNTRY_NOT_SUPPORTED',
+  ApiErrorCodes.countryNotAvailable: 'error.api.COUNTRY_NOT_AVAILABLE',
+  ApiErrorCodes.providerBudgetExceeded: 'error.api.PROVIDER_BUDGET_EXCEEDED',
+  ApiErrorCodes.reviewCaseNotClosed: 'error.api.REVIEW_CASE_NOT_CLOSED',
+  ApiErrorCodes.reviewNoAcceptedBid: 'error.api.REVIEW_NO_ACCEPTED_BID',
+  ApiErrorCodes.reviewAlreadyExists: 'error.api.REVIEW_ALREADY_EXISTS',
+  ApiErrorCodes.reviewAppealExists: 'error.api.REVIEW_APPEAL_EXISTS',
+  ApiErrorCodes.chatAttachmentsLocked: 'error.api.CHAT_ATTACHMENTS_LOCKED',
+  ApiErrorCodes.subscriptionPlanIncludesSeats:
+      'error.api.SUBSCRIPTION_PLAN_INCLUDES_SEATS',
+  ApiErrorCodes.assistantSeatsInUse: 'error.api.ASSISTANT_SEATS_IN_USE',
+  ApiErrorCodes.assistantNoFreeSeat: 'error.api.ASSISTANT_NO_FREE_SEAT',
+  ApiErrorCodes.assistantNotAllowed: 'error.api.ASSISTANT_NOT_ALLOWED',
+  ApiErrorCodes.assistantPhoneTaken: 'error.api.ASSISTANT_PHONE_TAKEN',
+  ApiErrorCodes.assistantInviteNotFound: 'error.api.ASSISTANT_INVITE_NOT_FOUND',
+  ApiErrorCodes.assistantCodeInvalid: 'error.api.ASSISTANT_CODE_INVALID',
+  ApiErrorCodes.assistantLiabilityRequired:
+      'error.api.ASSISTANT_LIABILITY_REQUIRED',
+  ApiErrorCodes.taskClosed: 'error.api.TASK_CLOSED',
+  ApiErrorCodes.taskStepsLimit: 'error.api.TASK_STEPS_LIMIT',
+  ApiErrorCodes.filesCountLimit: 'error.api.FILES_COUNT_LIMIT',
+  ApiErrorCodes.reviewEditWindowExpired: 'error.api.REVIEW_EDIT_WINDOW_EXPIRED',
+  ApiErrorCodes.reviewNotEditable: 'error.api.REVIEW_NOT_EDITABLE',
+  // Uploads (docs/03 §2.2). A checksum mismatch or a missing upload means
+  // the transfer broke: "try uploading again".
+  ApiErrorCodes.fileTypeNotAllowed: 'error.api.FILE_TYPE_NOT_ALLOWED',
+  ApiErrorCodes.fileTooLarge: 'error.api.FILE_TOO_LARGE',
+  ApiErrorCodes.storageQuotaExceeded: 'error.api.STORAGE_QUOTA_EXCEEDED',
+  ApiErrorCodes.chatStorageFull: 'error.api.CHAT_STORAGE_FULL',
+  // Owner 2026-10-01: reels and stickers.
+  ApiErrorCodes.videoUnavailable: 'error.api.VIDEO_UNAVAILABLE',
+  ApiErrorCodes.translationUnavailable: 'error.api.TRANSLATION_UNAVAILABLE',
+  ApiErrorCodes.supportTicketClosed: 'error.api.SUPPORT_TICKET_CLOSED',
+  ApiErrorCodes.referralCodeInvalid: 'error.api.REFERRAL_CODE_INVALID',
+  ApiErrorCodes.referralNotAllowed: 'error.api.REFERRAL_NOT_ALLOWED',
+  ApiErrorCodes.promoCodeInvalid: 'error.api.PROMO_CODE_INVALID',
+  ApiErrorCodes.payoutAccountNotReady: 'error.api.PAYOUT_ACCOUNT_NOT_READY',
+  ApiErrorCodes.paymentInvalidState: 'error.api.PAYMENT_INVALID_STATE',
+  ApiErrorCodes.paymentAmountInvalid: 'error.api.PAYMENT_AMOUNT_INVALID',
+  ApiErrorCodes.paymentFeeMaxRoundsReached:
+      'error.api.PAYMENT_FEE_MAX_ROUNDS_REACHED',
+  ApiErrorCodes.refundNotAllowed: 'error.api.REFUND_NOT_ALLOWED',
+  ApiErrorCodes.videoTooLong: 'error.api.VIDEO_TOO_LONG',
+  ApiErrorCodes.videoNotReady: 'error.api.VIDEO_NOT_READY',
+  ApiErrorCodes.commentsDisabled: 'error.api.COMMENTS_DISABLED',
+  ApiErrorCodes.licenseStateRequired: 'error.api.LICENSE_STATE_REQUIRED',
+  ApiErrorCodes.stickerLimitReached: 'error.api.STICKER_LIMIT_REACHED',
+  ApiErrorCodes.fileChecksumMismatch: 'error.api.FILE_UPLOAD_FAILED',
+  ApiErrorCodes.fileNotUploaded: 'error.api.FILE_UPLOAD_FAILED',
+  ApiErrorCodes.fileNotAttachable: 'error.api.FILE_NOT_ATTACHABLE',
+  ApiErrorCodes.fileStorageUnavailable: 'error.api.FILE_STORAGE_UNAVAILABLE',
+  // Verification (docs/03 §2.3). Verifier-only codes (lock, decisions)
+  // never reach the app but share the generic status text.
+  ApiErrorCodes.verificationAlreadyPending:
+      'error.api.VERIFICATION_ALREADY_PENDING',
+  ApiErrorCodes.verificationSubmissionLimit:
+      'error.api.VERIFICATION_SUBMISSION_LIMIT',
+  ApiErrorCodes.verificationInvalidStatus:
+      'error.api.VERIFICATION_INVALID_STATUS',
+  ApiErrorCodes.verificationIncomplete: 'error.api.VERIFICATION_INCOMPLETE',
+  ApiErrorCodes.verificationRequestLocked:
+      'error.api.VERIFICATION_INVALID_STATUS',
+  ApiErrorCodes.verificationDecisionIncomplete:
+      'error.api.VERIFICATION_INVALID_STATUS',
+  ApiErrorCodes.licenseAlreadyRegistered:
+      'error.api.LICENSE_ALREADY_REGISTERED',
+  ApiErrorCodes.licenseAlreadyAdded: 'error.api.LICENSE_ALREADY_ADDED',
+  ApiErrorCodes.attorneySuspended: 'error.api.ATTORNEY_SUSPENDED',
+  // Cases and bids (docs/04 §15, stage 4.1)
+  ApiErrorCodes.caseNotFound: 'error.api.CASE_NOT_FOUND',
+  ApiErrorCodes.caseInvalidState: 'error.api.CASE_INVALID_STATE',
+  ApiErrorCodes.bidInvalidState: 'error.api.BID_INVALID_STATE',
+  ApiErrorCodes.bidNotYourTurn: 'error.api.BID_NOT_YOUR_TURN',
+  ApiErrorCodes.bidMaxRoundsReached: 'error.api.BID_MAX_ROUNDS_REACHED',
+  ApiErrorCodes.bidCounterNotAllowed: 'error.api.BID_COUNTER_NOT_ALLOWED',
+  ApiErrorCodes.subscriptionRequired: 'error.api.SUBSCRIPTION_REQUIRED',
+  ApiErrorCodes.caseNotAvailable: 'error.api.CASE_NOT_AVAILABLE',
+  ApiErrorCodes.postNotFound: 'error.api.POST_NOT_FOUND',
+  ApiErrorCodes.postNotAllowed: 'error.api.POST_NOT_ALLOWED',
+  ApiErrorCodes.repostOwnPost: 'error.api.REPOST_OWN_POST',
+  ApiErrorCodes.commentNotFound: 'error.api.COMMENT_NOT_FOUND',
+  ApiErrorCodes.followNotAllowed: 'error.api.FOLLOW_NOT_ALLOWED',
+  ApiErrorCodes.conversationNotFound: 'error.api.CONVERSATION_NOT_FOUND',
+  ApiErrorCodes.conversationClosed: 'error.api.CONVERSATION_CLOSED',
+  ApiErrorCodes.messageTooLong: 'error.api.MESSAGE_TOO_LONG',
+  ApiErrorCodes.featureDisabled: 'error.api.FEATURE_DISABLED',
+  ApiErrorCodes.searchQueryTooShort: 'error.api.SEARCH_QUERY_TOO_SHORT',
+  ApiErrorCodes.userBlocked: 'error.api.USER_BLOCKED',
+  // Audit 2026-10-02: calls answered elsewhere / already gone.
+  ApiErrorCodes.callStateConflict: 'error.api.CALL_STATE_CONFLICT',
+  ApiErrorCodes.callNotFound: 'error.api.CALL_NOT_FOUND',
+  ApiErrorCodes.directChatNotAllowed: 'error.api.DIRECT_CHAT_NOT_ALLOWED',
+  ApiErrorCodes.messageRequestDeclined: 'error.api.MESSAGE_REQUEST_DECLINED',
+  ApiErrorCodes.messageRequestLimit: 'error.api.MESSAGE_REQUEST_LIMIT',
+  ApiErrorCodes.callNotAllowed: 'call.notAllowed',
+  ApiErrorCodes.callInProgress: 'call.inProgress',
+  ApiErrorCodes.bidAttorneyInactive: 'error.api.BID_ATTORNEY_INACTIVE',
+  ApiErrorCodes.trustLevelRequired: 'error.api.TRUST_LEVEL_REQUIRED',
+  ApiErrorCodes.attorneyOnHold: 'error.api.ATTORNEY_ON_HOLD',
+  ApiErrorCodes.barNumberBlocked: 'error.api.BAR_NUMBER_BLOCKED',
+  ApiErrorCodes.contactsLocked: 'error.api.CONTACTS_LOCKED',
+  ApiErrorCodes.contactIssueAlreadyOpen: 'error.api.CONTACT_ISSUE_ALREADY_OPEN',
+  ApiErrorCodes.contactIssueInvalidState:
+      'error.api.CONTACT_ISSUE_INVALID_STATE',
+  ApiErrorCodes.bidAlreadyExists: 'error.api.BID_ALREADY_EXISTS',
+  ApiErrorCodes.inviteNotFound: 'error.api.INVITE_NOT_FOUND',
+  ApiErrorCodes.inviteInvalidState: 'error.api.INVITE_INVALID_STATE',
+  ApiErrorCodes.inviteAlreadyPending: 'error.api.INVITE_ALREADY_PENDING',
+  ApiErrorCodes.seatLimitRequestPending: 'error.api.SEAT_LIMIT_REQUEST_PENDING',
+  ApiErrorCodes.seatLimitRequestDecided: 'error.api.SEAT_LIMIT_REQUEST_DECIDED',
+  ApiErrorCodes.inviteAttorneyUnavailable:
+      'error.api.INVITE_ATTORNEY_UNAVAILABLE',
+  ApiErrorCodes.inviteLimitReached: 'error.api.INVITE_LIMIT_REACHED',
+  ApiErrorCodes.caseContainsContactInfo: 'error.api.CASE_CONTAINS_CONTACT_INFO',
+  ApiErrorCodes.clientContactSharingConsentRequired:
+      'error.api.CLIENT_CONTACT_SHARING_CONSENT_REQUIRED',
+  ApiErrorCodes.legalReacceptRequired: 'error.api.LEGAL_REACCEPT_REQUIRED',
+  ApiErrorCodes.paymentsNotConfigured: 'error.api.PAYMENTS_NOT_CONFIGURED',
+  ApiErrorCodes.subscriptionAlreadyActive:
+      'error.api.SUBSCRIPTION_ALREADY_ACTIVE',
+  ApiErrorCodes.subscriptionTrialUnavailable:
+      'error.api.SUBSCRIPTION_TRIAL_UNAVAILABLE',
+  ApiErrorCodes.subscriptionSetupIncomplete:
+      'error.api.SUBSCRIPTION_SETUP_INCOMPLETE',
+  ApiErrorCodes.subscriptionNotFound: 'error.api.SUBSCRIPTION_NOT_FOUND',
+  ApiErrorCodes.payloadTooLarge: 'error.api.PAYLOAD_TOO_LARGE',
+  ApiErrorCodes.contentBlocked: 'error.api.CONTENT_BLOCKED',
+  ApiErrorCodes.reauthRequired: 'error.api.REAUTH_REQUIRED',
+  ApiErrorCodes.reauthInvalid: 'error.api.REAUTH_INVALID',
+  ApiErrorCodes.clientContactsIncomplete:
+      'error.api.CLIENT_CONTACTS_INCOMPLETE',
+  ApiErrorCodes.onboardingIncomplete: 'error.api.ONBOARDING_INCOMPLETE',
+  ApiErrorCodes.roleAlreadySet: 'error.api.ROLE_ALREADY_SET',
+  ApiErrorCodes.i18nLanguageNotFound: 'error.api.I18N_LANGUAGE_NOT_FOUND',
+  ApiErrorCodes.accountSuspended: 'error.api.ACCOUNT_SUSPENDED',
+  ApiErrorCodes.accountRestricted: 'error.api.ACCOUNT_RESTRICTED',
+  ApiErrorCodes.accountDeleted: 'error.api.ACCOUNT_DELETED',
+  ApiErrorCodes.authProviderDisabled: 'error.api.AUTH_PROVIDER_DISABLED',
+  ApiErrorCodes.deviceAttestationRequired:
+      'error.api.DEVICE_ATTESTATION_REQUIRED',
+  // Refresh-token theft signal (docs/01 §10.4): every session was revoked.
+  ApiErrorCodes.authRefreshReuseDetected:
+      'error.api.AUTH_REFRESH_REUSE_DETECTED',
+  // The session can't be continued; the user has to sign in again.
+  ApiErrorCodes.authSessionRevoked: 'error.api.AUTH_SESSION_REVOKED',
+  ApiErrorCodes.authSignedInElsewhere: 'error.api.AUTH_SIGNED_IN_ELSEWHERE',
+  ApiErrorCodes.authOtherDeviceActive: 'error.api.AUTH_OTHER_DEVICE_ACTIVE',
+  ApiErrorCodes.authRefreshExpired: 'error.api.AUTH_SESSION_REVOKED',
+  ApiErrorCodes.authRefreshInvalid: 'error.api.AUTH_SESSION_REVOKED',
+  ApiErrorCodes.authSocialTokenInvalid: 'auth.social.error.invalidToken',
+  ApiErrorCodes.authSocialProviderUnavailable:
+      'auth.social.error.providerDisabled',
+  ApiErrorCodes.idempotencyKeyConflict: 'error.api.IDEMPOTENCY_KEY_CONFLICT',
+  ApiErrorCodes.forbidden: 'error.api.FORBIDDEN',
+  ApiErrorCodes.notFound: 'error.api.NOT_FOUND',
+  ApiErrorCodes.notImplemented: 'error.api.NOT_IMPLEMENTED',
+  ApiErrorCodes.attorneyNotVerified: 'error.api.ATTORNEY_NOT_VERIFIED',
+  ApiErrorCodes.usernameTaken: 'error.api.USERNAME_TAKEN',
+  ApiErrorCodes.usernameReserved: 'error.api.USERNAME_RESERVED',
+  ApiErrorCodes.usernameChangeTooSoon: 'error.api.USERNAME_CHANGE_TOO_SOON',
+  // Owner 2026-10-05: demo mode (docs/ops/demo-world.md).
+  ApiErrorCodes.demoDisabled: 'error.api.DEMO_DISABLED',
+  ApiErrorCodes.demoLimitReached: 'error.api.DEMO_LIMIT_REACHED',
+  ApiErrorCodes.demoUnavailable: 'error.api.DEMO_UNAVAILABLE',
+  ApiErrorCodes.demoCodeInvalid: 'error.api.DEMO_CODE_INVALID',
+  // Client-side synthetic code (contact_verification_controller.dart).
+  'NO_REAUTH_CONTACT': 'error.api.NO_REAUTH_CONTACT',
+};

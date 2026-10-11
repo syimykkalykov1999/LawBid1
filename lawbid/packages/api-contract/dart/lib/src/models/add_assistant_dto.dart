@@ -1,0 +1,32 @@
+// coverage:ignore-file
+// GENERATED CODE - DO NOT MODIFY BY HAND
+// ignore_for_file: type=lint, unused_import, invalid_annotation_target, unnecessary_import
+
+import 'package:json_annotation/json_annotation.dart';
+
+import 'add_assistant_dto_duties.dart';
+
+part 'add_assistant_dto.g.dart';
+
+@JsonSerializable()
+class AddAssistantDto {
+  const AddAssistantDto({
+    this.phone,
+    this.name,
+    this.duties,
+    this.acceptLiability,
+  });
+
+  factory AddAssistantDto.fromJson(Map<String, Object?> json) =>
+      _$AddAssistantDtoFromJson(json);
+
+  /// Optional (older apps). The assistant joins with the one-time code the seat gets.
+  final String? phone;
+  final String? name;
+  final List<AddAssistantDtoDuties>? duties;
+
+  /// OQ-049: required (true) when granting "bids" or "publish" — the attorney accepts full responsibility for the assistant's bids, negotiations and publications.
+  final bool? acceptLiability;
+
+  Map<String, Object?> toJson() => _$AddAssistantDtoToJson(this);
+}
