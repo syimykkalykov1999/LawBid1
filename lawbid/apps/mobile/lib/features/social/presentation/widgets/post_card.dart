@@ -4,6 +4,7 @@ import 'dart:ui' show ImageFilter;
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:lawbid/core/demo_web/demo_flags.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -605,7 +606,7 @@ class _InstagramPost extends ConsumerWidget {
           onLeadingTap: () => openAuthorProfile(context, ref, p.author),
           expanded: inDetail,
           // Owner 2026-10-07: two lines in the feed, the rest inside.
-          collapsedLines: 2,
+          collapsedLines: ref.watch(demoFlagProvider('feed.caption3')) ? 3 : 2,
           onMore: inDetail ? null : open,
           mentions: p.mentions,
           large: !hasMedia,
