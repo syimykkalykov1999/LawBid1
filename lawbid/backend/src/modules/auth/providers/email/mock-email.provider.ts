@@ -22,11 +22,15 @@ export class MockEmailProvider implements EmailProvider {
     private readonly logger: PinoLogger,
   ) {
     this.logger.setContext(MockEmailProvider.name);
-    this.transporter = nodemailer.createTransport({
-      host: this.config.getOrThrow<string>('SMTP_HOST'),
-      port: this.config.getOrThrow<number>('SMTP_PORT'),
-      secure: false,
-    });
+    // Test server: there is no mail catcher, so nothing leaves the process.
+    this.transporter =
+      this.config.get<boolean>('TEST_SERVER_MODE') === true
+        ? nodemailer.createTransport({ jsonTransport: true })
+        : nodemailer.createTransport({
+            host: this.config.getOrThrow<string>('SMTP_HOST'),
+            port: this.config.getOrThrow<number>('SMTP_PORT'),
+            secure: false,
+          });
   }
 
   async sendEmail(message: EmailMessage): Promise<void> {

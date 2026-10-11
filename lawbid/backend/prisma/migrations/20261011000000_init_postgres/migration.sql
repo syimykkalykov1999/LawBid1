@@ -1,5 +1,6 @@
 -- Склеено из 141 старой миграции CockroachDB и переведено на Postgres (11.10.2026).
--- Убрано: роли и GRANT, hash-шардирование, триграммные индексы.
+-- Убрано: роли и GRANT, hash-шардирование.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- Stage 1.3: auth schema (docs/01_FOUNDATION_AUTH.md §15 -- generated via
 -- `prisma migrate diff --from-empty --to-schema-datamodel` (no live
 -- CockroachDB instance was available in the sandbox to run
@@ -1564,6 +1565,15 @@ CREATE INDEX "notifications_unread_idx" ON "notifications" ("user_id") WHERE "re
 CREATE INDEX "posts_author_published_idx" ON "posts" ("author_id", "created_at" DESC)
   WHERE "status" = 'published' AND "deleted_at" IS NULL;
 
+-- ---------------------------------------------------------------------
+-- §5.3 search: trigram, full-text, array GIN
+-- ---------------------------------------------------------------------
+CREATE INDEX "attorney_profiles_username_trgm_idx" ON "attorney_profiles" USING gin ("username_lower" gin_trgm_ops);
+
+CREATE INDEX "users_full_name_trgm_idx" ON "users" USING gin ("full_name_lower" gin_trgm_ops);
+
+CREATE INDEX "tags_tag_trgm_idx" ON "tags" USING gin ("tag_lower" gin_trgm_ops);
+
 CREATE INDEX "posts_search_tsv_idx" ON "posts" USING gin ("search_tsv");
 
 CREATE INDEX "cases_search_tsv_idx" ON "cases" USING gin ("search_tsv");
@@ -1611,6 +1621,15 @@ DROP INDEX IF EXISTS "users_full_name_trgm_idx";
 DROP INDEX IF EXISTS "attorney_profiles_username_trgm_idx";
 
 DROP INDEX IF EXISTS "tags_tag_trgm_idx";
+
+CREATE INDEX "users_full_name_trgm_idx" ON "users" USING gin ("full_name_lower" gin_trgm_ops)
+  WHERE "full_name_lower" IS NOT NULL;
+
+CREATE INDEX "attorney_profiles_username_trgm_idx" ON "attorney_profiles" USING gin ("username_lower" gin_trgm_ops)
+  WHERE "username_lower" IS NOT NULL;
+
+CREATE INDEX "tags_tag_trgm_idx" ON "tags" USING gin ("tag_lower" gin_trgm_ops)
+  WHERE "tag_lower" IS NOT NULL;
 -- AlterEnum
 ALTER TYPE "notification_type" ADD VALUE 'review_requested';
 
@@ -1835,6 +1854,12 @@ ALTER TABLE "client_profiles" ADD COLUMN "username_lower" TEXT;
 ALTER TABLE "client_profiles" ADD COLUMN "username_changed_at" TIMESTAMPTZ;
 
 CREATE UNIQUE INDEX "client_profiles_username_lower_key" ON "client_profiles"("username_lower");
+
+-- People search (docs/05 §7.3 extended to clients): trigram index like the
+-- attorney one (docs/02 §5.3), partial on rows that have a username.
+CREATE INDEX IF NOT EXISTS "client_profiles_username_trgm_idx"
+  ON "client_profiles" USING GIN ("username_lower" gin_trgm_ops)
+  WHERE "username_lower" IS NOT NULL;
 -- Owner decision 2026-09-29 (docs/OPEN_QUESTIONS.md OQ-028): a block
 -- system for every user. One row per (blocker, blocked).
 CREATE TABLE "user_blocks" (

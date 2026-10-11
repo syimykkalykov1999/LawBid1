@@ -22,10 +22,9 @@ export class NotificationsRetentionJob {
     let deleted = 0;
     while (deleted < MAX_PER_RUN) {
       const n = await this.prisma.$executeRaw`
-        DELETE FROM notifications
-        WHERE created_at < ${before}
-        ORDER BY created_at
-        LIMIT ${BATCH}`;
+        DELETE FROM notifications WHERE ctid IN (
+          SELECT ctid FROM notifications WHERE created_at < ${before}
+          ORDER BY created_at LIMIT ${BATCH})`;
       deleted += n;
       if (n < BATCH) break;
       // Short pause so a big backlog never hogs the DB (load review).

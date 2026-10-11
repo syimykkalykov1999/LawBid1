@@ -98,7 +98,7 @@ export class CaseStalePromptJob {
           (after) =>
             this.prisma.$queryRaw<KeyRow[]>(Prisma.sql`
               SELECT id::TEXT AS id, last_activity_at AS at
-              FROM cases@cases_open_unprompted_idx
+              FROM cases
               WHERE status = 'open' AND deleted_at IS NULL
                 AND stale_prompt_sent_at IS NULL
                 AND last_activity_at < ${inactiveBefore}
@@ -139,7 +139,7 @@ export class CaseAutoArchiveJob {
           (after) =>
             this.prisma.$queryRaw<KeyRow[]>(Prisma.sql`
               SELECT id::TEXT AS id, stale_prompt_sent_at AS at
-              FROM cases@cases_open_prompted_idx
+              FROM cases
               WHERE status = 'open' AND deleted_at IS NULL
                 AND stale_prompt_sent_at IS NOT NULL
                 AND stale_prompt_sent_at < ${promptedBefore}
