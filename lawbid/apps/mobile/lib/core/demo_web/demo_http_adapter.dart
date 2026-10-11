@@ -86,7 +86,7 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
     }
     final similar = _similar(sources, path);
     if (similar != null) return _ok(similar);
-    if (!_hasId(path)) {
+    if (_kind(data, path) == 'list') {
       return _ok({
         'data': const <Object>[],
         'meta': {'nextCursor': null},
@@ -108,6 +108,25 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
   );
 
   static bool _hasId(String path) => path.split('/').any(_idSegment.hasMatch);
+
+  /// `list` or `object`, from the API contract (written by enrich.py).
+  static String? _kind(Map<String, dynamic> data, String path) {
+    final kinds = data['kinds'] as Map<String, dynamic>? ?? const {};
+    final parts = path.split('/');
+    for (final entry in kinds.entries) {
+      final pattern = entry.key.split('/');
+      if (pattern.length != parts.length) continue;
+      var ok = true;
+      for (var i = 0; i < parts.length; i++) {
+        if (!pattern[i].startsWith('{') && pattern[i] != parts[i]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return entry.value as String;
+    }
+    return null;
+  }
 
   static String _shape(String path) =>
       path.split('/').map((s) => _idSegment.hasMatch(s) ? '*' : s).join('/');
@@ -263,8 +282,11 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
   static ResponseBody _ok(Object body) => _json(200, body);
 
   static ResponseBody _json(int status, Object body) {
+    // `demo-asset:<key>` marks a bundled picture or clip; on the web it is
+    // served from the same site under `<base>/assets/<key>`.
+    final base = Uri.base.removeFragment().resolve('./').toString();
     return ResponseBody.fromString(
-      jsonEncode(body),
+      jsonEncode(body).replaceAll('demo-asset:', '${base}assets/'),
       status,
       headers: {
         Headers.contentTypeHeader: ['application/json; charset=utf-8'],
