@@ -1,0 +1,642 @@
+import {
+  BadRequestException,
+  ForbiddenException,
+  Inject,
+  Injectable,
+  Optional,
+} from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
+import { createHash } from 'node:crypto';
+import type Redis from 'ioredis';
+import { ErrorCode } from '../../common/errors/error-code.enum';
+import {
+  decodeCursor,
+  encodeCursor,
+} from '../../common/pagination/cursor.util';
+import { UsageLimitsService } from '../../common/usage-limits/usage-limits.service';
+import { AppSettingsService } from '../../common/app-settings/app-settings.service';
+import { loadUrgencyThresholds } from '../cases/domain/case-urgency';
+import { PrismaService } from '../../prisma/prisma.service';
+import { REDIS_CLIENT } from '../../redis/redis.constants';
+import type { RequestUser } from '../auth/decorators/current-user.decorator';
+import type { CaseFeedPage } from '../cases/dto/cases-feed.dto';
+import { CaseAccessPolicy } from '../cases/policies/case-access.policy';
+import { CasesFeedService } from '../cases/services/cases-feed.service';
+import type { AttorneyListPage } from '../follows/follows.dto';
+import { FollowsService } from '../follows/follows.service';
+import {
+  ContentFilterService,
+  type PostContentClass,
+} from '../posts/content-filter.service';
+import type { PostDto, PostPage } from '../posts/dto/posts.dto';
+import {
+  PostPresenter,
+  VISIBLE_POST_WHERE,
+} from '../posts/post-presenter.service';
+import { BlocksService } from '../blocks/blocks.service';
+import { ClientProfilesService } from '../profiles/services/client-profiles.service';
+import type {
+  PeoplePage,
+  PersonItemDto,
+  SearchAttorneysQueryDto,
+  SearchCasesQueryDto,
+  SearchPeopleQueryDto,
+  SearchPeriod,
+  TagDto,
+  TagSort,
+  SearchPostsQueryDto,
+} from './search.dto';
+import {
+  SEARCH_PROVIDER,
+  TRENDING_TAGS_KEY,
+  type SearchProvider,
+} from './search.provider';
+
+const PAGE = 20;
+/** Ranked results kept per query: 10 pages. */
+const RANKED_MAX = 200;
+/** Ranked id lists are shared by everyone asking the same thing. */
+const RANKED_TTL_SEC = 5 * 60;
+const TAG_TOP_MAX = 500;
+const TAG_TOP_TTL_SEC = 10 * 60;
+/** Tag "Топ" ranks the newest tagged posts only (bounded cost). */
+const TAG_TOP_CANDIDATES = 5000;
+
+const PERIOD_MS: Record<SearchPeriod, number | null> = {
+  '24h': 24 * 3600 * 1000,
+  '7d': 7 * 24 * 3600 * 1000,
+  '30d': 30 * 24 * 3600 * 1000,
+  all: null,
+};
+
+/** Lowercase, single spaces, no leading '@'/'#'. */
+export function normalizeQuery(raw: string): string {
+  return raw
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[@#]+/, '')
+    .trim();
+}
+
+function invalid(field: string, message: string): BadRequestException {
+  return new BadRequestException({
+    code: ErrorCode.VALIDATION_ERROR,
+    message,
+    details: { field },
+  });
+}
+
+function textQuery(raw: string): string {
+  const q = normalizeQuery(raw);
+  if (q.length < 2) {
+    throw new BadRequestException({
+      code: ErrorCode.SEARCH_QUERY_TOO_SHORT,
+      message: 'At least 2 characters.',
+      details: { field: 'q', min: 2 },
+    });
+  }
+  return q;
+}
+
+function encodeIndex(i: number): string {
+  return Buffer.from(JSON.stringify({ i })).toString('base64url');
+}
+
+function decodeIndex(raw: string | undefined): number {
+  if (!raw) return 0;
+  try {
+    const { i } = JSON.parse(
+      Buffer.from(raw, 'base64url').toString('utf8'),
+    ) as { i?: unknown };
+    if (typeof i === 'number' && Number.isInteger(i) && i >= 0) return i;
+  } catch {
+    // fall through
+  }
+  throw invalid('cursor', 'Invalid cursor.');
+}
+
+/**
+ * docs/05 §7 (stage 5.6). Ranked results (attorneys, posts, tag "Топ") are
+ * computed once per query into a short-lived shared id list and paged by
+ * position, so the next pages cost one Redis read. Cache keys hash the
+ * query and never contain the user id (§7.6). Cases are searched per
+ * attorney and always filtered by CaseAccessPolicy.
+ */
+@Injectable()
+export class SearchService {
+  constructor(
+    @Inject(SEARCH_PROVIDER) private readonly provider: SearchProvider,
+    private readonly prisma: PrismaService,
+    private readonly limits: UsageLimitsService,
+    private readonly follows: FollowsService,
+    private readonly posts: PostPresenter,
+    private readonly casesFeed: CasesFeedService,
+    private readonly access: CaseAccessPolicy,
+    private readonly clients: ClientProfilesService,
+    private readonly blocks: BlocksService,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    @Optional() private readonly settings?: AppSettingsService,
+    @Optional() private readonly contentFilter?: ContentFilterService,
+  ) {}
+
+  /** Owner 2026-10-05: a "Legal only" viewer never sees general posts. */
+  private async viewerOnly(
+    viewerId: string,
+  ): Promise<PostContentClass | undefined> {
+    const mode = await this.contentFilter?.modeOf(viewerId);
+    return mode === 'legal_only' ? 'legal' : undefined;
+  }
+
+  /**
+   * GET /search/people (OQ-026): attorneys and clients by @username and
+   * name in one ranked list. The shared ranked cache stores "role:id"
+   * tokens; each page is presented per role and re-merged in rank order.
+   */
+  async people(
+    user: RequestUser,
+    dto: SearchPeopleQueryDto,
+  ): Promise<PeoplePage> {
+    await this.limits.consume('search', user.sub);
+    const q = textQuery(dto.q);
+    const filters = {
+      practiceAreaId: dto.practiceAreaId,
+      state: dto.state?.toUpperCase(),
+      minRating: dto.minRating,
+      language: dto.language?.toLowerCase(),
+      role: dto.role,
+      verifiedOnly: dto.verifiedOnly,
+    };
+    const tokens = await this.ranked('pp', { q, ...filters }, async () =>
+      (await this.provider.searchPeople(q, filters, RANKED_MAX)).map(
+        (r) => `${r.role}:${r.id}`,
+      ),
+    );
+    const { slice: rawSlice, next } = this.pageOf(tokens, dto.cursor);
+    // OQ-028: the shared ranked list is viewer-agnostic; blocks (either
+    // direction) are applied per viewer when presenting.
+    const hidden = await this.blocks.hiddenIds(user.sub);
+    const slice = rawSlice.filter((t) => !hidden.has(t.split(':', 2)[1]));
+    const attorneyIds = slice
+      .filter((t) => t.startsWith('attorney:'))
+      .map((t) => t.slice('attorney:'.length));
+    const clientIds = slice
+      .filter((t) => t.startsWith('client:'))
+      .map((t) => t.slice('client:'.length));
+    const [attorneys, clients] = await Promise.all([
+      this.follows.present(attorneyIds, user.sub),
+      this.clients.presentMany(clientIds),
+    ]);
+    const byAttorney = new Map(attorneys.map((a) => [a.id, a]));
+    const byClient = new Map(clients.map((c) => [c.id, c]));
+    const items: PersonItemDto[] = [];
+    for (const token of slice) {
+      const [role, id] = token.split(':', 2) as ['attorney' | 'client', string];
+      if (role === 'attorney') {
+        const a = byAttorney.get(id);
+        if (a) items.push({ role, attorney: a, client: null });
+      } else {
+        const c = byClient.get(id);
+        if (c) items.push({ role, attorney: null, client: c });
+      }
+    }
+    return { items, nextCursor: next };
+  }
+
+  async attorneys(
+    user: RequestUser,
+    dto: SearchAttorneysQueryDto,
+  ): Promise<AttorneyListPage> {
+    await this.limits.consume('search', user.sub);
+    const q = textQuery(dto.q);
+    const filters = {
+      practiceAreaId: dto.practiceAreaId,
+      state: dto.state?.toUpperCase(),
+      minRating: dto.minRating,
+      language: dto.language?.toLowerCase(),
+    };
+    const ids = await this.ranked('a', { q, ...filters }, () =>
+      this.provider.searchAttorneys(q, filters, RANKED_MAX),
+    );
+    const { slice, next } = this.pageOf(ids, dto.cursor);
+    return {
+      items: await this.follows.present(slice, user.sub),
+      nextCursor: next,
+    };
+  }
+
+  async cases(
+    user: RequestUser,
+    dto: SearchCasesQueryDto,
+  ): Promise<CaseFeedPage> {
+    if (user.role !== 'attorney') {
+      throw new ForbiddenException({
+        code: ErrorCode.FORBIDDEN,
+        message: 'Only attorneys search cases.',
+      });
+    }
+    await this.limits.consume('search', user.sub);
+    const q = textQuery(dto.q);
+    if (!(await this.casesFeed.isVerifiedAttorney(user.sub))) {
+      return { items: [], nextCursor: null };
+    }
+    const span = PERIOD_MS[dto.period ?? 'all'];
+    const rows = await this.provider.searchCases(q, {
+      attorneyId: user.sub,
+      practiceAreaId: dto.practiceAreaId,
+      state: dto.state?.toUpperCase(),
+      since: span ? new Date(Date.now() - span) : undefined,
+      cursor: dto.cursor ? decodeCursor(dto.cursor) : undefined,
+      limit: PAGE,
+      practiceCategory: dto.practiceCategory,
+      budgetMinCents:
+        dto.budgetMin === undefined ? undefined : dto.budgetMin * 100,
+      budgetMaxCents:
+        dto.budgetMax === undefined ? undefined : dto.budgetMax * 100,
+      budgetUnknown: dto.budgetUnknown,
+      noBids: dto.noBids,
+      minUrgency: dto.minUrgency,
+      hasDeadline: dto.hasDeadline,
+      urgencyThresholds: dto.minUrgency
+        ? await loadUrgencyThresholds(this.settings)
+        : undefined,
+    });
+    const page = rows.slice(0, PAGE);
+    // §7.6: the provider's rows still pass the single access check.
+    const visible = await this.access.visibleCaseIds(
+      user.sub,
+      page.map((r) => r.id),
+    );
+    const last = page[page.length - 1];
+    return {
+      items: await this.casesFeed.hydrate(
+        page.map((r) => r.id).filter((id) => visible.has(id)),
+        user.sub,
+      ),
+      nextCursor:
+        rows.length > PAGE && last
+          ? encodeCursor({ createdAt: last.created_at, id: last.id })
+          : null,
+    };
+  }
+
+  async postsByText(
+    user: RequestUser,
+    rawQ: string,
+    cursor?: string,
+    dto?: SearchPostsQueryDto,
+  ): Promise<PostPage> {
+    await this.limits.consume('search', user.sub);
+    const q = textQuery(rawQ);
+    const span = PERIOD_MS[dto?.period ?? 'all'];
+    const filters = {
+      tag: dto?.tag?.toLowerCase(),
+      practice: dto?.practice?.trim().toLowerCase(),
+      state: dto?.state?.toUpperCase(),
+      since: span ? new Date(Date.now() - span) : undefined,
+      withPhotos: dto?.withPhotos,
+      sort: dto?.sort,
+      contentClass: await this.viewerOnly(user.sub),
+    };
+    const ids = await this.ranked(
+      'p',
+      { q, ...filters, since: dto?.period ?? 'all' },
+      () => this.provider.searchPosts(q, RANKED_MAX, filters),
+    );
+    const { slice, next } = this.pageOf(ids, cursor);
+    return {
+      items: await this.presentPosts(slice, user.sub),
+      nextCursor: next,
+    };
+  }
+
+  async tags(user: RequestUser, rawQ: string): Promise<TagDto[]> {
+    await this.limits.consume('search', user.sub);
+    const prefix = normalizeQuery(rawQ);
+    if (prefix.length < 1) throw invalid('q', 'Empty tag.');
+    const tags = await this.provider.searchTags(prefix, PAGE);
+    if (tags.length === 0) return [];
+    // Audit 2026-10-01: how many published posts carry each tag; the most
+    // used first (alphabetical sorting stays an option in the app).
+    const counts = await this.prisma.$queryRaw<{ tag: string; n: bigint }[]>`
+      SELECT t.tag_lower AS tag, count(p.id) AS n
+      FROM tags t
+      LEFT JOIN post_tags pt ON pt.tag_id = t.id
+      LEFT JOIN posts p ON p.id = pt.post_id
+        AND p.status = 'published' AND p.deleted_at IS NULL
+        -- Only posts anyone can see (active, not deleted authors).
+        AND EXISTS (SELECT 1 FROM users u WHERE u.id = p.author_id
+                    AND u.status = 'active' AND u.deleted_at IS NULL)
+      WHERE t.tag_lower = ANY(${tags}::TEXT[])
+      GROUP BY t.tag_lower`;
+    const byTag = new Map(counts.map((c) => [c.tag, Number(c.n)]));
+    return tags
+      .map((tag) => ({ tag, postsCount: byTag.get(tag) ?? 0 }))
+      .sort(
+        (a, b) => b.postsCount - a.postsCount || a.tag.localeCompare(b.tag),
+      );
+  }
+
+  /** §7.2 "Популярные темы": written by TrendingTagsJob. */
+  async trending(): Promise<TagDto[]> {
+    const raw = await this.redis.get(TRENDING_TAGS_KEY);
+    return raw ? (JSON.parse(raw) as TagDto[]) : [];
+  }
+
+  /** GET /tags/:tag/posts — "Топ" by the §2.2.2 score, "Новые" by date. */
+  /** Owner 2026-09-30 (OQ-034): newest posts of attorneys licensed in a
+   * state — the feed's "All" topic with a state chosen. */
+  async latestPosts(
+    user: RequestUser,
+    state: string | undefined,
+    cursor?: string,
+    filter: {
+      states?: string[];
+      practices?: string[];
+      practice?: string;
+      tag?: string;
+      kind?: 'post' | 'news';
+      period?: SearchPeriod;
+      withPhotos?: boolean;
+      sort?: 'newest' | 'popular';
+      contentClass?: PostContentClass;
+    } = {},
+  ): Promise<PostPage> {
+    const contentClass =
+      filter.contentClass ?? (await this.viewerOnly(user.sub));
+    const popular = filter.sort === 'popular';
+    // Popular pages by offset; newest keeps the keyset cursor.
+    const offset = popular && cursor ? Number(cursor) || 0 : 0;
+    const c = !popular && cursor ? decodeCursor(cursor) : undefined;
+    const span = PERIOD_MS[filter.period ?? 'all'];
+    const practice = filter.practice?.trim().toLowerCase();
+    const tag = filter.tag ? normalizeQuery(filter.tag) : '';
+    const rows = await this.prisma.post.findMany({
+      where: {
+        // Audit 2026-10-01: every condition AND-composed — the state filter
+        // used to overwrite VISIBLE_POST_WHERE's `author` (active, not
+        // suspended) and the practice clause shared the `AND` key.
+        AND: [
+          VISIBLE_POST_WHERE,
+          authorStateWhere([
+            ...(state ? [state] : []),
+            ...(filter.states ?? []),
+          ]),
+          // Owner 2026-10-06: «Только мои темы» — any of the picked
+          // qualifications, each with its subcategories.
+          ...(filter.practices?.length
+            ? [
+                {
+                  OR: filter.practices.flatMap((p) => [
+                    { practice_area: { code: p } },
+                    { practice_area: { code: { startsWith: `${p}.` } } },
+                  ]),
+                },
+              ]
+            : []),
+          // Audit 2026-10-01: nothing of people blocked either way.
+          {
+            author_id: { notIn: [...(await this.blocks.hiddenIds(user.sub))] },
+          },
+          ...(filter.kind ? [{ kind: filter.kind }] : []),
+          ...(contentClass ? [{ content_class: contentClass }] : []),
+          ...(span
+            ? [{ created_at: { gte: new Date(Date.now() - span) } }]
+            : []),
+          ...(filter.withPhotos ? [{ media: { some: {} } }] : []),
+          // Owner 2026-09-30: the qualification and its subcategories;
+          // older posts (no qualification) by their topic hashtag.
+          ...(practice
+            ? [
+                {
+                  OR: [
+                    { practice_area: { code: practice } },
+                    {
+                      practice_area: {
+                        code: { startsWith: `${practice}.` },
+                      },
+                    },
+                    ...(tag
+                      ? [
+                          {
+                            practice_area_id: null,
+                            tags: { some: { tag: { tag_lower: tag } } },
+                          },
+                        ]
+                      : []),
+                  ],
+                },
+              ]
+            : []),
+          ...(c
+            ? [
+                {
+                  OR: [
+                    { created_at: { lt: c.createdAt } },
+                    { created_at: c.createdAt, id: { lt: c.id } },
+                  ],
+                },
+              ]
+            : []),
+        ],
+      },
+      orderBy: popular
+        ? [
+            { like_count: 'desc' },
+            { comment_count: 'desc' },
+            { created_at: 'desc' },
+            { id: 'desc' },
+          ]
+        : [{ created_at: 'desc' }, { id: 'desc' }],
+      ...(popular ? { skip: offset } : {}),
+      take: PAGE + 1,
+    });
+    const page = rows.slice(0, PAGE);
+    const last = page[page.length - 1];
+    if (popular) {
+      return {
+        items: await this.posts.present(page, user.sub),
+        nextCursor: rows.length > PAGE ? String(offset + PAGE) : null,
+      };
+    }
+    return {
+      items: await this.posts.present(page, user.sub),
+      nextCursor:
+        rows.length > PAGE && last
+          ? encodeCursor({ createdAt: last.created_at, id: last.id })
+          : null,
+    };
+  }
+
+  async tagPosts(
+    user: RequestUser,
+    rawTag: string,
+    sort: TagSort,
+    cursor?: string,
+    state?: string,
+    videoOnly?: boolean,
+  ): Promise<PostPage> {
+    const tagLower = normalizeQuery(rawTag);
+    const tag = tagLower
+      ? await this.prisma.tag.findUnique({
+          where: { tag_lower: tagLower },
+          select: { id: true },
+        })
+      : null;
+    if (!tag) return { items: [], nextCursor: null };
+    const contentClass = await this.viewerOnly(user.sub);
+    // Owner 2026-09-30 (OQ-034): a state filter always lists newest first.
+    if (sort === 'new' || state || videoOnly) {
+      const c = cursor ? decodeCursor(cursor) : undefined;
+      const rows = await this.prisma.post.findMany({
+        where: {
+          // Audit 2026-10-01: AND so the state filter keeps the author checks.
+          AND: [
+            VISIBLE_POST_WHERE,
+            authorStateWhere(state ? [state] : []),
+            {
+              author_id: {
+                notIn: [...(await this.blocks.hiddenIds(user.sub))],
+              },
+            },
+          ],
+          tags: { some: { tag_id: tag.id } },
+          ...(contentClass ? { content_class: contentClass } : {}),
+          ...(videoOnly ? { video_asset_id: { not: null } } : {}),
+          ...(c
+            ? {
+                OR: [
+                  { created_at: { lt: c.createdAt } },
+                  { created_at: c.createdAt, id: { lt: c.id } },
+                ],
+              }
+            : {}),
+        },
+        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+        take: PAGE + 1,
+      });
+      const page = rows.slice(0, PAGE);
+      const last = page[page.length - 1];
+      return {
+        items: await this.posts.present(page, user.sub),
+        nextCursor:
+          rows.length > PAGE && last
+            ? encodeCursor({ createdAt: last.created_at, id: last.id })
+            : null,
+      };
+    }
+    const ids = await this.cached(`tag:top:${tag.id}`, TAG_TOP_TTL_SEC, () =>
+      this.topOfTag(tag.id),
+    );
+    const { slice, next } = this.pageOf(ids, cursor);
+    return {
+      items: await this.presentPosts(slice, user.sub, contentClass),
+      nextCursor: next,
+    };
+  }
+
+  private async topOfTag(tagId: string): Promise<string[]> {
+    const rows = await this.prisma.$queryRaw<{ id: string }[]>`
+      WITH recent AS (
+        SELECT p.id FROM post_tags pt
+        JOIN posts p ON p.id = pt.post_id
+        WHERE pt.tag_id = ${tagId}::UUID
+          AND p.status = 'published' AND p.deleted_at IS NULL
+        ORDER BY p.created_at DESC
+        LIMIT ${TAG_TOP_CANDIDATES}
+      )
+      SELECT p.id::TEXT AS id FROM recent
+      JOIN posts p ON p.id = recent.id
+      JOIN users u ON u.id = p.author_id AND u.status = 'active'
+        -- OQ-038: clients post too; suspended attorneys never show.
+        AND NOT EXISTS (SELECT 1 FROM attorney_profiles sa
+          WHERE sa.user_id = p.author_id AND sa.verification_status = 'suspended')
+      ORDER BY
+        (p.like_count + 2 * p.comment_count + 2 * p.save_count)::FLOAT8
+          / power(GREATEST(EXTRACT(EPOCH FROM (now() - p.created_at)) / 3600, 0) + 2, 1.5)
+          DESC,
+        p.created_at DESC, p.id DESC
+      LIMIT ${TAG_TOP_MAX}`;
+    return rows.map((r) => r.id);
+  }
+
+  private ranked(
+    kind: string,
+    params: Record<string, unknown>,
+    load: () => Promise<string[]>,
+  ): Promise<string[]> {
+    const hash = createHash('sha256')
+      .update(JSON.stringify(params))
+      .digest('base64url');
+    return this.cached(`search:${kind}:${hash}`, RANKED_TTL_SEC, load);
+  }
+
+  private async cached(
+    key: string,
+    ttlSec: number,
+    load: () => Promise<string[]>,
+  ): Promise<string[]> {
+    const hit = await this.redis.get(key);
+    if (hit) return JSON.parse(hit) as string[];
+    const ids = await load();
+    await this.redis.set(key, JSON.stringify(ids), 'EX', ttlSec);
+    return ids;
+  }
+
+  private pageOf(
+    ids: string[],
+    cursor: string | undefined,
+  ): { slice: string[]; next: string | null } {
+    const start = decodeIndex(cursor);
+    const end = start + PAGE;
+    return {
+      slice: ids.slice(start, end),
+      next: end < ids.length ? encodeIndex(end) : null,
+    };
+  }
+
+  /** Rows in [ids] order; hidden/deleted since caching drop out. */
+  private async presentPosts(
+    ids: string[],
+    viewerId: string,
+    contentClass?: PostContentClass,
+  ): Promise<PostDto[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.prisma.post.findMany({
+      where: {
+        ...VISIBLE_POST_WHERE,
+        ...(contentClass ? { content_class: contentClass } : {}),
+        id: { in: ids },
+      },
+    });
+    const hidden = await this.blocks.hiddenIds(viewerId);
+    const byId = new Map(
+      rows.filter((p) => !hidden.has(p.author_id)).map((p) => [p.id, p]),
+    );
+    return this.posts.present(
+      ids.flatMap((id) => {
+        const p = byId.get(id);
+        return p ? [p] : [];
+      }),
+      viewerId,
+    );
+  }
+}
+
+/** Posts whose author holds a verified license in [state] (none = any). */
+/** Posts of attorneys with a verified licence in any of [states]
+ * (owner 2026-10-06: several states at once); none = no state filter. */
+function authorStateWhere(states: string[]): Prisma.PostWhereInput {
+  const codes = [...new Set(states.map((s) => s.toUpperCase()))];
+  if (codes.length === 0) return {};
+  return {
+    author: {
+      attorney_profile: {
+        licenses: {
+          some: { state_code: { in: codes }, license_status: 'verified' },
+        },
+      },
+    },
+  };
+}

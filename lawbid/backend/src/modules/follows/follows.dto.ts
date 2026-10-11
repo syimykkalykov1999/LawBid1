@@ -1,0 +1,88 @@
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
+import { RatingDto } from '../profiles/dto/attorney-profile.dto';
+import { ClientListItemDto } from '../profiles/dto/client-profile.dto';
+
+export class AttorneyIdParamDto {
+  @ApiProperty({ format: 'uuid' })
+  @IsUUID('all')
+  id!: string;
+}
+
+export class FollowsQueryDto {
+  @ApiPropertyOptional({ description: 'meta.nextCursor of the previous page.' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(300)
+  cursor?: string;
+}
+
+/** An attorney row in follower/following/suggestion lists (docs/05 §6). */
+export class AttorneyListItemDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  username!: string;
+
+  @ApiPropertyOptional({ type: String, nullable: true })
+  firstName!: string | null;
+
+  @ApiPropertyOptional({ type: String, nullable: true })
+  lastName!: string | null;
+
+  @ApiPropertyOptional({ type: String, nullable: true })
+  avatarUrl!: string | null;
+
+  @ApiProperty()
+  verifiedBadge!: boolean;
+
+  @ApiProperty({
+    type: 'integer',
+    minimum: 0,
+    maximum: 3,
+    description: 'Trust level.',
+  })
+  trustLevel!: number;
+
+  @ApiProperty({ type: RatingDto })
+  rating!: RatingDto;
+
+  @ApiProperty({ type: [String], description: 'Verified license state codes.' })
+  states!: string[];
+
+  @ApiProperty({
+    type: [String],
+    description: 'i18n keys of the first practices (docs/05 §7.3).',
+  })
+  practiceI18nKeys!: string[];
+
+  @ApiProperty({ description: 'The viewer follows this attorney.' })
+  isFollowing!: boolean;
+}
+
+export interface AttorneyListPage {
+  items: AttorneyListItemDto[];
+  nextCursor: string | null;
+}
+
+export const PERSON_ROLES = ['attorney', 'client'] as const;
+export type PersonRoleValue = (typeof PERSON_ROLES)[number];
+
+/** One person row (OQ-026: People search, attorney followers): exactly
+ * one of [attorney]/[client] is set, by [role]. */
+export class PersonItemDto {
+  @ApiProperty({ enum: PERSON_ROLES, enumName: 'PersonRole' })
+  role!: PersonRoleValue;
+
+  @ApiPropertyOptional({ type: AttorneyListItemDto, nullable: true })
+  attorney!: AttorneyListItemDto | null;
+
+  @ApiPropertyOptional({ type: ClientListItemDto, nullable: true })
+  client!: ClientListItemDto | null;
+}
+
+export interface PeoplePage {
+  items: PersonItemDto[];
+  nextCursor: string | null;
+}

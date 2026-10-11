@@ -1,0 +1,3 @@
+#cloud-config
+runcmd:
+  - [bash, -c, "curl -fsSL https://raw.githubusercontent.com/syimykkalykov1999/LawBid1/main/lawbid/backend/deploy/install.sh | bash > /var/log/lawbid-install.log 2>&1"]

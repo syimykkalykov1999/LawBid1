@@ -1,0 +1,892 @@
+import Stripe from 'stripe';
+import {
+  type PaymentProvider,
+  type ProviderCharge,
+  type ProviderCheckoutSession,
+  type ProviderConnectAccount,
+  type ProviderConnectPerson,
+  type ProviderConnectedCharge,
+  type ProviderConnectedCheckout,
+  type ProviderConnectedCheckoutInput,
+  type ProviderCoupon,
+  type ProviderCouponInput,
+  type ProviderEvent,
+  type ProviderRefund,
+  type ProviderInvoice,
+  type ProviderOneTimeCheckoutInput,
+  type ProviderPrice,
+  type ProviderPriceInput,
+  type ProviderSetupIntent,
+  type ProviderSubscription,
+  WebhookSignatureError,
+} from './payment-provider';
+import { demoDenyProxy } from '../../common/demo/demo-guards';
+
+/**
+ * docs/06 §1.4–1.6 over the official SDK. Period boundaries are read from
+ * the subscription item (where recent API versions keep them) with the
+ * legacy top-level fields as a fallback.
+ */
+export class StripePaymentProvider implements PaymentProvider {
+  readonly name = 'stripe' as const;
+  private readonly stripe: Stripe;
+  private readonly live: boolean;
+
+  get mode(): 'test' | 'live' {
+    return this.live ? 'live' : 'test';
+  }
+
+  constructor(
+    secretKey: string,
+    private readonly webhookSecret: string | undefined,
+    /** Owner 2026-10-05: the Connect endpoint's own signing secret
+     * (events of connected accounts); falls back to [webhookSecret]. */
+    private readonly connectWebhookSecret?: string,
+  ) {
+    // Demo accounts can never reach Stripe (src/common/demo).
+    this.stripe = demoDenyProxy(
+      new Stripe(secretKey, {
+        typescript: true,
+        maxNetworkRetries: 2,
+        // A hung Stripe call fails in seconds, not minutes: the admin sees a
+        // clear "check the Stripe key" instead of a timed-out request.
+        timeout: 20_000,
+      }),
+      'Payments',
+    );
+    this.live = /^(sk|rk)_live_/.test(secretKey);
+  }
+
+  async createCustomer(input: {
+    userId: string;
+    email: string | null;
+  }): Promise<string> {
+    const c = await this.stripe.customers.create(
+      {
+        ...(input.email ? { email: input.email } : {}),
+        metadata: { userId: input.userId },
+      },
+      { idempotencyKey: `customer:${input.userId}` },
+    );
+    return c.id;
+  }
+
+  async createSetupIntent(
+    customerId: string,
+  ): Promise<{ id: string; clientSecret: string }> {
+    const si = await this.stripe.setupIntents.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+      usage: 'off_session',
+    });
+    return { id: si.id, clientSecret: si.client_secret ?? '' };
+  }
+
+  async retrieveSetupIntent(id: string): Promise<ProviderSetupIntent | null> {
+    try {
+      const si = await this.stripe.setupIntents.retrieve(id);
+      return {
+        id: si.id,
+        customerId:
+          typeof si.customer === 'string'
+            ? si.customer
+            : (si.customer?.id ?? null),
+        status: si.status,
+        paymentMethodId:
+          typeof si.payment_method === 'string'
+            ? si.payment_method
+            : (si.payment_method?.id ?? null),
+      };
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+  }
+
+  async paymentMethodFingerprint(
+    paymentMethodId: string,
+  ): Promise<string | null> {
+    const pm = await this.stripe.paymentMethods.retrieve(paymentMethodId);
+    return pm.card?.fingerprint ?? null;
+  }
+
+  async createSubscription(input: {
+    customerId: string;
+    priceId: string;
+    paymentMethodId: string;
+    trialDays: number | null;
+    metadata: Record<string, string>;
+  }): Promise<ProviderSubscription> {
+    const sub = await this.stripe.subscriptions.create(
+      {
+        customer: input.customerId,
+        items: [{ price: input.priceId }],
+        default_payment_method: input.paymentMethodId,
+        ...(input.trialDays ? { trial_period_days: input.trialDays } : {}),
+        payment_settings: { save_default_payment_method: 'on_subscription' },
+        // §1.3: a trial that can't be charged ends up `unpaid` → expired.
+        trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+        metadata: input.metadata,
+      },
+      {
+        // Retries within the hour dedupe; a later re-subscription with the
+        // same card is a new request (Stripe replays a key for 24 h).
+        idempotencyKey: `subscription:${input.metadata.userId}:${input.paymentMethodId}:${input.trialDays ?? 0}:${new Date().toISOString().slice(0, 13)}`,
+      },
+    );
+    return mapSubscription(sub);
+  }
+
+  async retrieveSubscription(id: string): Promise<ProviderSubscription | null> {
+    try {
+      return mapSubscription(await this.stripe.subscriptions.retrieve(id));
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+  }
+
+  async setCancelAtPeriodEnd(
+    id: string,
+    cancel: boolean,
+  ): Promise<ProviderSubscription> {
+    return mapSubscription(
+      await this.stripe.subscriptions.update(id, {
+        cancel_at_period_end: cancel,
+      }),
+    );
+  }
+
+  async cancelNow(id: string): Promise<ProviderSubscription> {
+    return mapSubscription(await this.stripe.subscriptions.cancel(id));
+  }
+
+  async extendUntil(
+    id: string,
+    untilUnix: number,
+  ): Promise<ProviderSubscription> {
+    return mapSubscription(
+      await this.stripe.subscriptions.update(id, {
+        trial_end: untilUnix,
+        proration_behavior: 'none',
+      }),
+    );
+  }
+
+  async createPortalSession(
+    customerId: string,
+    returnUrl: string,
+  ): Promise<string> {
+    const s = await this.stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: returnUrl,
+    });
+    return s.url;
+  }
+
+  async setSeatQuantity(
+    subscriptionId: string,
+    seatPriceId: string,
+    quantity: number,
+    knownSeatPriceIds: string[] = [],
+  ): Promise<ProviderSubscription> {
+    const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+    const ids = new Set([seatPriceId, ...knownSeatPriceIds]);
+    const item = sub.items.data.find((i) => ids.has(i.price.id));
+    const items: Stripe.SubscriptionUpdateParams.Item[] = item
+      ? quantity > 0
+        ? [{ id: item.id, quantity }]
+        : [{ id: item.id, deleted: true }]
+      : quantity > 0
+        ? [{ price: seatPriceId, quantity }]
+        : [];
+    return mapSubscription(
+      await this.stripe.subscriptions.update(subscriptionId, {
+        items,
+        proration_behavior: 'create_prorations',
+      }),
+    );
+  }
+
+  async switchToYearly(
+    subscriptionId: string,
+    yearlyPriceId: string,
+  ): Promise<ProviderSubscription> {
+    const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+    const items: Stripe.SubscriptionUpdateParams.Item[] = [
+      ...sub.items.data.map((i) => ({ id: i.id, deleted: true })),
+      { price: yearlyPriceId, quantity: 1 },
+    ];
+    return mapSubscription(
+      await this.stripe.subscriptions.update(subscriptionId, {
+        items,
+        proration_behavior: 'always_invoice',
+      }),
+    );
+  }
+
+  async createPrice(input: ProviderPriceInput): Promise<ProviderPrice> {
+    let productId = input.productId;
+    if (!productId && input.productFromPriceId) {
+      try {
+        const old = await this.stripe.prices.retrieve(input.productFromPriceId);
+        productId =
+          typeof old.product === 'string' ? old.product : old.product.id;
+      } catch (e) {
+        if (!isNotFound(e)) throw e;
+      }
+    }
+    const price = await this.stripe.prices.create(
+      {
+        currency: input.currency,
+        unit_amount: input.amountCents,
+        recurring: { interval: input.interval },
+        metadata: input.metadata,
+        ...(productId
+          ? { product: productId }
+          : {
+              product_data: {
+                name: input.productName,
+                metadata: input.metadata,
+              },
+            }),
+      },
+      { idempotencyKey: input.idempotencyKey },
+    );
+    return {
+      priceId: price.id,
+      productId:
+        typeof price.product === 'string' ? price.product : price.product.id,
+    };
+  }
+
+  async replaceItemPrice(
+    subscriptionId: string,
+    fromPriceIds: string[],
+    toPriceId: string,
+  ): Promise<ProviderSubscription | null> {
+    const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+    const from = new Set(fromPriceIds);
+    const items = sub.items.data
+      .filter((i) => from.has(i.price.id) && i.price.id !== toPriceId)
+      .map((i) => ({ id: i.id, price: toPriceId, quantity: i.quantity }));
+    if (items.length === 0) return null;
+    return mapSubscription(
+      await this.stripe.subscriptions.update(subscriptionId, {
+        items,
+        proration_behavior: 'none',
+      }),
+    );
+  }
+
+  async endTrialNow(id: string): Promise<ProviderSubscription> {
+    return mapSubscription(
+      await this.stripe.subscriptions.update(id, { trial_end: 'now' }),
+    );
+  }
+
+  async createCheckoutSession(input: {
+    customerId: string;
+    lineItems: { priceId: string; quantity: number }[];
+    trialDays: number | null;
+    successUrl: string;
+    cancelUrl: string;
+    metadata: Record<string, string>;
+    couponId?: string | null;
+  }): Promise<ProviderCheckoutSession> {
+    const s = await this.stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: input.customerId,
+      line_items: input.lineItems.map((l) => ({
+        price: l.priceId,
+        quantity: l.quantity,
+      })),
+      payment_method_collection: 'always',
+      subscription_data: {
+        ...(input.trialDays ? { trial_period_days: input.trialDays } : {}),
+        metadata: input.metadata,
+      },
+      metadata: input.metadata,
+      client_reference_id: input.metadata.userId,
+      success_url: input.successUrl,
+      cancel_url: input.cancelUrl,
+      // Owner 2026-10-02: Stripe takes either a fixed discount or the
+      // page's promotion-code box, not both.
+      ...(input.couponId
+        ? { discounts: [{ coupon: input.couponId }] }
+        : { allow_promotion_codes: true }),
+      // Our words under the button (logo and colours: Stripe Dashboard →
+      // Settings → Branding).
+      custom_text: {
+        submit: {
+          message:
+            'LawBid Attorney subscription. Cancel anytime in the app → Subscription.',
+        },
+      },
+    });
+    return mapCheckout(s);
+  }
+
+  async retrieveCheckoutSession(
+    id: string,
+  ): Promise<ProviderCheckoutSession | null> {
+    try {
+      return mapCheckout(await this.stripe.checkout.sessions.retrieve(id));
+    } catch {
+      return null;
+    }
+  }
+
+  /** Owner 2026-10-02 (referrals): negative balance = credit on the next
+   * invoice. */
+  async creditCustomerBalance(
+    customerId: string,
+    cents: number,
+    description: string,
+    idempotencyKey?: string,
+  ): Promise<void> {
+    await this.stripe.customers.createBalanceTransaction(
+      customerId,
+      { amount: -Math.abs(cents), currency: 'usd', description },
+      idempotencyKey ? { idempotencyKey } : undefined,
+    );
+  }
+
+  /** Owner 2026-10-02 (case promotion): one-time hosted payment. */
+  async createOneTimeCheckout(
+    input: ProviderOneTimeCheckoutInput,
+  ): Promise<{ id: string; url: string }> {
+    const s = await this.stripe.checkout.sessions.create(
+      {
+        mode: 'payment',
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: 'usd',
+              unit_amount: input.amountCents,
+              product_data: { name: input.description },
+            },
+          },
+        ],
+        ...(input.customerEmail ? { customer_email: input.customerEmail } : {}),
+        metadata: input.metadata,
+        payment_intent_data: { metadata: input.metadata },
+        client_reference_id: input.metadata.userId,
+        success_url: input.successUrl,
+        cancel_url: input.cancelUrl,
+      },
+      input.idempotencyKey
+        ? { idempotencyKey: input.idempotencyKey }
+        : undefined,
+    );
+    return { id: s.id, url: s.url ?? '' };
+  }
+
+  async retrieveInvoice(id: string): Promise<ProviderInvoice | null> {
+    try {
+      const inv = await this.stripe.invoices.retrieve(id);
+      return mapInvoice(inv);
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+  }
+
+  async retrieveCharge(id: string): Promise<ProviderCharge | null> {
+    try {
+      const ch = await this.stripe.charges.retrieve(id);
+      return {
+        id: ch.id,
+        paymentIntentId:
+          typeof ch.payment_intent === 'string'
+            ? ch.payment_intent
+            : (ch.payment_intent?.id ?? null),
+        refunded: ch.refunded,
+        amountRefundedCents: ch.amount_refunded,
+      };
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+  }
+
+  async createCoupon(input: ProviderCouponInput): Promise<ProviderCoupon> {
+    // No idempotency key: a code whose limits changed gets a new coupon.
+    const coupon = await this.stripe.coupons.create({
+      name: input.code,
+      duration: 'once',
+      ...(input.percentOff
+        ? { percent_off: input.percentOff }
+        : {
+            amount_off: input.amountOffCents ?? 0,
+            currency: input.currency,
+          }),
+      ...(input.maxRedemptions
+        ? { max_redemptions: input.maxRedemptions }
+        : {}),
+      ...(input.redeemBy ? { redeem_by: input.redeemBy } : {}),
+      metadata: input.metadata,
+    });
+    let promotionCodeId: string | null = null;
+    try {
+      const pc = await this.stripe.promotionCodes.create({
+        promotion: { type: 'coupon', coupon: coupon.id },
+        code: input.code,
+        ...(input.maxRedemptions
+          ? { max_redemptions: input.maxRedemptions }
+          : {}),
+        ...(input.redeemBy ? { expires_at: input.redeemBy } : {}),
+        metadata: input.metadata,
+      });
+      promotionCodeId = pc.id;
+    } catch {
+      // The code may already exist in Stripe (created by hand): the
+      // coupon alone is enough for the API's checkout.
+    }
+    return { couponId: coupon.id, promotionCodeId };
+  }
+
+  async deleteCoupon(couponId: string): Promise<void> {
+    try {
+      await this.stripe.coupons.del(couponId);
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+  }
+
+  async refund(input: {
+    paymentIntentId: string;
+    amountCents: number;
+    idempotencyKey: string;
+    metadata: Record<string, string>;
+  }): Promise<ProviderRefund> {
+    const r = await this.stripe.refunds.create(
+      {
+        payment_intent: input.paymentIntentId,
+        amount: input.amountCents,
+        metadata: input.metadata,
+      },
+      { idempotencyKey: input.idempotencyKey },
+    );
+    return {
+      id: r.id,
+      status:
+        r.status === 'succeeded'
+          ? 'succeeded'
+          : r.status === 'failed' || r.status === 'canceled'
+            ? 'failed'
+            : 'pending',
+      failureReason: r.failure_reason ?? null,
+    };
+  }
+
+  constructWebhookEvent(
+    rawBody: Buffer,
+    signature: string | undefined,
+    options: { connect?: boolean } = {},
+  ): ProviderEvent {
+    const secret = options.connect
+      ? (this.connectWebhookSecret ?? this.webhookSecret)
+      : this.webhookSecret;
+    if (!secret || !signature) {
+      throw new WebhookSignatureError('Webhook secret or signature missing');
+    }
+    let event: Stripe.Event;
+    try {
+      event = this.stripe.webhooks.constructEvent(rawBody, signature, secret);
+    } catch (e) {
+      throw new WebhookSignatureError(
+        e instanceof Error ? e.message : 'Invalid signature',
+      );
+    }
+    const object = event.data.object as unknown as ProviderEvent['object'];
+    // A Connect event names the connected account it happened on.
+    const account = (event as { account?: string }).account;
+    return {
+      id: event.id,
+      type: event.type,
+      created: event.created,
+      object: account ? { ...object, _account: account } : object,
+    };
+  }
+
+  // ---- Stripe Connect (owner 2026-10-05) ----------------------------------
+
+  async createConnectAccount(input: {
+    userId: string;
+    email: string | null;
+    country: string;
+  }): Promise<string> {
+    const acc = await this.stripe.accounts.create(
+      {
+        type: 'express',
+        country: input.country,
+        ...(input.email ? { email: input.email } : {}),
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+        business_type: 'individual',
+        business_profile: {
+          mcc: '8111', // legal services
+          product_description: 'Legal services booked through LawBid',
+        },
+        metadata: { userId: input.userId },
+      },
+      { idempotencyKey: `connect-account:${input.userId}` },
+    );
+    return acc.id;
+  }
+
+  async createAccountOnboardingLink(input: {
+    accountId: string;
+    refreshUrl: string;
+    returnUrl: string;
+  }): Promise<string> {
+    const link = await this.stripe.accountLinks.create({
+      account: input.accountId,
+      refresh_url: input.refreshUrl,
+      return_url: input.returnUrl,
+      type: 'account_onboarding',
+    });
+    return link.url;
+  }
+
+  async createAccountLoginLink(accountId: string): Promise<string> {
+    const link = await this.stripe.accounts.createLoginLink(accountId);
+    return link.url;
+  }
+
+  async retrieveConnectAccount(
+    accountId: string,
+  ): Promise<ProviderConnectAccount | null> {
+    try {
+      const account = await this.stripe.accounts.retrieve(accountId);
+      const mapped = mapConnectAccount(account);
+      // Company accounts: the representative and owners are Persons, not
+      // fields of the account (the trust check compares them with the
+      // attorney, never the company name).
+      if (account.business_type && account.business_type !== 'individual') {
+        const persons = await this.stripe.accounts.listPersons(accountId, {
+          limit: 20,
+        });
+        mapped.people = persons.data.map(mapPerson);
+      }
+      return mapped;
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+  }
+
+  async updateConnectPayoutDelay(
+    accountId: string,
+    days: number | null,
+  ): Promise<void> {
+    await this.stripe.accounts.update(accountId, {
+      settings: {
+        payouts: {
+          schedule:
+            days === null
+              ? { interval: 'daily', delay_days: 'minimum' }
+              : { interval: 'daily', delay_days: days },
+        },
+      },
+    });
+  }
+
+  async createConnectedCheckout(
+    input: ProviderConnectedCheckoutInput,
+  ): Promise<{ id: string; url: string }> {
+    const s = await this.stripe.checkout.sessions.create(
+      {
+        mode: 'payment',
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: 'usd',
+              unit_amount: input.amountCents,
+              product_data: { name: input.description },
+            },
+          },
+        ],
+        ...(input.customerId
+          ? {
+              customer: input.customerId,
+              ...(input.saveCard
+                ? {
+                    saved_payment_method_options: {
+                      payment_method_save: 'enabled' as const,
+                    },
+                  }
+                : {}),
+            }
+          : input.customerEmail
+            ? { customer_email: input.customerEmail }
+            : {}),
+        metadata: input.metadata,
+        payment_intent_data: {
+          metadata: input.metadata,
+          ...(input.applicationFeeCents > 0
+            ? { application_fee_amount: input.applicationFeeCents }
+            : {}),
+        },
+        client_reference_id: input.metadata.userId,
+        success_url: input.successUrl,
+        cancel_url: input.cancelUrl,
+      },
+      {
+        stripeAccount: input.accountId,
+        ...(input.idempotencyKey
+          ? { idempotencyKey: input.idempotencyKey }
+          : {}),
+      },
+    );
+    return { id: s.id, url: s.url ?? '' };
+  }
+
+  async ensureConnectedCustomer(input: {
+    accountId: string;
+    email: string | null;
+    name: string | null;
+    metadata: Record<string, string>;
+  }): Promise<string> {
+    const c = await this.stripe.customers.create(
+      {
+        ...(input.email ? { email: input.email } : {}),
+        ...(input.name ? { name: input.name } : {}),
+        metadata: input.metadata,
+      },
+      { stripeAccount: input.accountId },
+    );
+    return c.id;
+  }
+
+  async retrieveConnectedCheckout(
+    accountId: string,
+    sessionId: string,
+  ): Promise<ProviderConnectedCheckout | null> {
+    try {
+      const s = await this.stripe.checkout.sessions.retrieve(
+        sessionId,
+        { expand: ['payment_intent.latest_charge'] },
+        { stripeAccount: accountId },
+      );
+      const pi = typeof s.payment_intent === 'string' ? null : s.payment_intent;
+      const charge =
+        pi && typeof pi.latest_charge !== 'string' ? pi.latest_charge : null;
+      return {
+        id: s.id,
+        accountId,
+        url: s.url ?? null,
+        status: (s.status ?? 'open') as ProviderConnectedCheckout['status'],
+        paymentStatus: s.payment_status ?? null,
+        paymentIntentId:
+          typeof s.payment_intent === 'string'
+            ? s.payment_intent
+            : (pi?.id ?? null),
+        chargeId:
+          charge?.id ??
+          (typeof pi?.latest_charge === 'string' ? pi.latest_charge : null),
+        receiptUrl: charge?.receipt_url ?? null,
+        amountTotalCents: s.amount_total ?? null,
+        metadata: s.metadata ?? {},
+      };
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+  }
+
+  async refundConnected(input: {
+    accountId: string;
+    paymentIntentId: string;
+    amountCents: number;
+    refundApplicationFee: boolean;
+    idempotencyKey: string;
+    metadata: Record<string, string>;
+  }): Promise<ProviderRefund> {
+    const r = await this.stripe.refunds.create(
+      {
+        payment_intent: input.paymentIntentId,
+        amount: input.amountCents,
+        refund_application_fee: input.refundApplicationFee,
+        metadata: input.metadata,
+      },
+      { stripeAccount: input.accountId, idempotencyKey: input.idempotencyKey },
+    );
+    return {
+      id: r.id,
+      status:
+        r.status === 'succeeded'
+          ? 'succeeded'
+          : r.status === 'failed' || r.status === 'canceled'
+            ? 'failed'
+            : 'pending',
+      failureReason: r.failure_reason ?? null,
+    };
+  }
+
+  async retrieveConnectedCharge(
+    accountId: string,
+    chargeId: string,
+  ): Promise<ProviderConnectedCharge | null> {
+    try {
+      // `dispute` is not on the Charge type of this SDK version; the
+      // open dispute (if any) is listed by charge instead.
+      const ch = await this.stripe.charges.retrieve(chargeId, undefined, {
+        stripeAccount: accountId,
+      });
+      const dispute = ch.disputed
+        ? ((
+            await this.stripe.disputes.list(
+              { charge: chargeId, limit: 1 },
+              { stripeAccount: accountId },
+            )
+          ).data[0] ?? null)
+        : null;
+      return {
+        id: ch.id,
+        paymentIntentId:
+          typeof ch.payment_intent === 'string'
+            ? ch.payment_intent
+            : (ch.payment_intent?.id ?? null),
+        amountCents: ch.amount,
+        amountRefundedCents: ch.amount_refunded,
+        refunded: ch.refunded,
+        receiptUrl: ch.receipt_url ?? null,
+        disputed: ch.disputed,
+        disputeStatus: dispute?.status ?? null,
+      };
+    } catch (e) {
+      if (isNotFound(e)) return null;
+      throw e;
+    }
+  }
+
+  dashboardUrl(subscriptionId: string): string {
+    return `https://dashboard.stripe.com/${this.live ? '' : 'test/'}subscriptions/${subscriptionId}`;
+  }
+}
+
+function mapConnectAccount(a: Stripe.Account): ProviderConnectAccount {
+  const due = [
+    ...(a.requirements?.currently_due ?? []),
+    ...(a.requirements?.past_due ?? []),
+  ];
+  return {
+    id: a.id,
+    chargesEnabled: Boolean(a.charges_enabled),
+    payoutsEnabled: Boolean(a.payouts_enabled),
+    detailsSubmitted: Boolean(a.details_submitted),
+    requirementsDue: [...new Set(due)],
+    disabledReason: a.requirements?.disabled_reason ?? null,
+    country: a.country ?? null,
+    businessType: a.business_type ?? null,
+    legalFirstName: a.individual?.first_name ?? null,
+    legalLastName: a.individual?.last_name ?? null,
+    companyName: a.company?.name ?? null,
+    companyUrl: a.business_profile?.url ?? null,
+  };
+}
+
+function mapPerson(p: Stripe.Person): ProviderConnectPerson {
+  const r = p.relationship;
+  const role = r?.representative
+    ? 'representative'
+    : r?.owner
+      ? 'owner'
+      : r?.executive
+        ? 'executive'
+        : r?.director
+          ? 'director'
+          : null;
+  return {
+    firstName: p.first_name ?? null,
+    lastName: p.last_name ?? null,
+    role,
+  };
+}
+
+function isNotFound(e: unknown): boolean {
+  return (
+    e instanceof Stripe.errors.StripeError && e.code === 'resource_missing'
+  );
+}
+
+type SubLike = Stripe.Subscription & {
+  current_period_start?: number;
+  current_period_end?: number;
+};
+
+function mapSubscription(sub: Stripe.Subscription): ProviderSubscription {
+  const s = sub as SubLike;
+  const item = sub.items?.data?.[0] as
+    | (Stripe.SubscriptionItem & {
+        current_period_start?: number;
+        current_period_end?: number;
+      })
+    | undefined;
+  return {
+    id: sub.id,
+    customerId:
+      typeof sub.customer === 'string' ? sub.customer : sub.customer.id,
+    status: sub.status as ProviderSubscription['status'],
+    trialStart: sub.trial_start ?? null,
+    trialEnd: sub.trial_end ?? null,
+    currentPeriodStart:
+      item?.current_period_start ?? s.current_period_start ?? null,
+    currentPeriodEnd: item?.current_period_end ?? s.current_period_end ?? null,
+    cancelAtPeriodEnd: sub.cancel_at_period_end,
+    canceledAt: sub.canceled_at ?? null,
+    defaultPaymentMethodId:
+      typeof sub.default_payment_method === 'string'
+        ? sub.default_payment_method
+        : (sub.default_payment_method?.id ?? null),
+    metadata: sub.metadata ?? {},
+  };
+}
+
+type InvoiceLike = Stripe.Invoice & {
+  subscription?: string | { id: string } | null;
+  payment_intent?: string | { id: string } | null;
+};
+
+function mapInvoice(inv: Stripe.Invoice): ProviderInvoice {
+  const i = inv as InvoiceLike;
+  const sub =
+    i.subscription ?? i.parent?.subscription_details?.subscription ?? null;
+  const pi = i.payment_intent ?? null;
+  return {
+    id: inv.id,
+    customerId:
+      typeof inv.customer === 'string'
+        ? inv.customer
+        : (inv.customer?.id ?? null),
+    subscriptionId: typeof sub === 'string' ? sub : (sub?.id ?? null),
+    amountCents: inv.amount_paid || inv.amount_due,
+    currency: inv.currency,
+    status: (inv.status ?? 'open') as ProviderInvoice['status'],
+    paidAt: inv.status_transitions?.paid_at ?? null,
+    paymentIntentId: typeof pi === 'string' ? pi : (pi?.id ?? null),
+    failureCode: null,
+  };
+}
+
+function mapCheckout(s: Stripe.Checkout.Session): ProviderCheckoutSession {
+  const ref = (v: string | { id: string } | null | undefined) =>
+    v == null ? null : typeof v === 'string' ? v : v.id;
+  return {
+    id: s.id,
+    url: s.url ?? null,
+    status: (s.status ?? 'open') as ProviderCheckoutSession['status'],
+    customerId: ref(s.customer),
+    subscriptionId: ref(s.subscription),
+    metadata: s.metadata ?? {},
+    paymentIntentId: ref(s.payment_intent),
+    amountTotalCents: s.amount_total ?? null,
+    paymentStatus: s.payment_status ?? null,
+  };
+}

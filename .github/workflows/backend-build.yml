@@ -1,0 +1,16 @@
+name: Backend build
+
+# Проверяет, что тестовый сервер собирается (тот же Dockerfile, что на машине).
+on:
+  pull_request:
+    paths: ['lawbid/backend/**', 'lawbid/shared/localization/**']
+  push:
+    branches: [main]
+    paths: ['lawbid/backend/**']
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f lawbid/backend/Dockerfile -t lawbid-test-api lawbid

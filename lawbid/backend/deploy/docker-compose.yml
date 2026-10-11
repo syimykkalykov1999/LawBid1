@@ -1,0 +1,79 @@
+# LawBid test server: one machine, everything inside. Started by install.sh.
+name: lawbid-test
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lawbid
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: lawbid
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lawbid"]
+      interval: 5s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+  s3:
+    # Our own tiny S3 (scripts/test-s3.mjs): MinIO no longer ships a free image.
+    image: lawbid-test-api
+    restart: unless-stopped
+    command: ["node", "scripts/test-s3.mjs"]
+    volumes: [s3data:/data]
+  api:
+    image: lawbid-test-api
+    build:
+      context: ../..
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      s3: { condition: service_started }
+    environment:
+      NODE_ENV: development
+      PORT: "3000"
+      DATABASE_URL: postgresql://lawbid:${DB_PASSWORD}@postgres:5432/lawbid
+      DEMO_DATABASE_URL: "off"
+      REDIS_URL: redis://redis:6379
+      JWT_KEYS: k1:${JWT_SECRET}
+      JWT_ACTIVE_KID: k1
+      OTP_CODE_SECRET: ${OTP_SECRET}
+      OTP_KEY_PEPPER: ${OTP_PEPPER}
+      AUTH_EVENT_PEPPER: ${EVENT_PEPPER}
+      # Test server: any phone, code 000000, nothing is sent anywhere.
+      OTP_DEV_FIXED_CODE: "true"
+      TEST_SERVER_MODE: "true"
+      SMS_PROVIDER: mock
+      EMAIL_PROVIDER: mock
+      TRUST_PROXY_HOPS: "1"
+      S3_ENDPOINT: https://${S3_HOST}
+      S3_REGION: us-east-1
+      S3_BUCKET_DOCUMENTS: lawbid-documents
+      S3_BUCKET_MEDIA: lawbid-media
+      S3_ACCESS_KEY_ID: lawbid
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET}
+      WEB_ORIGINS: ${WEB_ORIGINS}
+      # The real AWS must never be reachable from here.
+      AWS_ACCESS_KEY_ID: ""
+      AWS_SECRET_ACCESS_KEY: ""
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [api, s3]
+    ports: ["80:80", "443:443"]
+    environment:
+      API_HOST: ${API_HOST}
+      S3_HOST: ${S3_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+volumes: { pgdata: {}, redisdata: {}, s3data: {}, caddydata: {} }

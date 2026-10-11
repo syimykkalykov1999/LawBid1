@@ -1,0 +1,1018 @@
+import { ClientFraudService } from '../client-fraud/client-fraud.service';
+import { AccountBansService } from '../account-bans/account-bans.service';
+import {
+  OTP_DAILY_WINDOW_SECONDS,
+  OTP_LIMIT_WINDOW_SECONDS,
+  otpDailyLimit,
+} from './otp-limits';
+import { AppSettingsService } from '../../common/app-settings/app-settings.service';
+import {
+  ForbiddenException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+  NotFoundException,
+  UnauthorizedException,
+  ConflictException,
+  Inject,
+  Optional,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { User } from '@prisma/client';
+import type Redis from 'ioredis';
+import { randomBytes } from 'node:crypto';
+import { REDIS_CLIENT } from '../../redis/redis.constants';
+import { PrismaService } from '../../prisma/prisma.service';
+import { withDeleted } from '../../prisma/soft-delete.extension';
+import { withTxRetry } from '../../prisma/tx-retry.util';
+import { ErrorCode } from '../../common/errors/error-code.enum';
+import { OtpService } from './services/otp.service';
+import { RateLimitService } from './services/rate-limit.service';
+import { IdentityService } from './services/identity.service';
+import {
+  SessionService,
+  type DeviceInfo,
+  type RequestMeta,
+} from './services/session.service';
+import { SessionRevocationService } from './services/session-revocation.service';
+import { TokenService } from './services/token.service';
+import {
+  AuthEventService,
+  AUTH_EVENT_TYPES,
+} from './services/auth-event.service';
+import { GoogleTokenVerifier } from './social/google-token-verifier.service';
+import { AppleTokenVerifier } from './social/apple-token-verifier.service';
+import type { OtpRequestDto } from './dto/otp-request.dto';
+import type { OtpVerifyDto } from './dto/otp-verify.dto';
+import type { OtpVerifyLinkDto } from './dto/otp-verify-link.dto';
+import type { RefreshTokenDto } from './dto/refresh-token.dto';
+import type { ReauthDto } from './dto/reauth.dto';
+import type { LinkIdentifierDto } from './dto/link-identifier.dto';
+import type { RequestUser } from './decorators/current-user.decorator';
+import type { AuthTokensResult } from './social/auth-result.types';
+import { LoginMethodPolicy } from './services/login-method-policy.service';
+import { NewDeviceNotifier } from './notifications/new-device-notifier.service';
+import { AssistantCodeService } from './assistant/assistant-code.service';
+import type { AssistantCodeLoginDto } from './dto/assistant-code-login.dto';
+
+const ENV = {
+  otpPerIdentifierPerHour: 'OTP_RATE_LIMIT_PER_IDENTIFIER_PER_HOUR',
+  otpPerIdentifierPerDay: 'OTP_RATE_LIMIT_PER_IDENTIFIER_PER_DAY',
+  otpPerIpPerHour: 'OTP_RATE_LIMIT_PER_IP_PER_HOUR',
+  otpPerDevicePerHour: 'OTP_RATE_LIMIT_PER_DEVICE_PER_HOUR',
+  otpVerifyPerHour: 'AUTH_OTP_VERIFY_LIMIT_PER_HOUR',
+  otpVerifyPerIpPerHour: 'OTP_VERIFY_LIMIT_PER_IP_PER_HOUR',
+  refreshPerIpPerHour: 'AUTH_REFRESH_LIMIT_PER_IP_PER_HOUR',
+} as const;
+
+export interface SessionListItem {
+  sessionId: string; // session_chain_id
+  deviceId: string | null;
+  deviceName: string | null;
+  platform: string | null;
+  appVersion: string | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+  isCurrent: boolean;
+}
+
+/**
+ * Top-level orchestrator for every /auth/* route except /auth/social
+ * (see SocialAuthService — independent branch, docs/CHANGELOG.md stage
+ * 1.4). Ties together OtpService, SessionService, TokenService,
+ * IdentityService, AuthEventService and RateLimitService per endpoint,
+ * per .cursorrules ("Логика только в service" — AuthController stays a
+ * thin HTTP-shape layer, see auth.controller.ts).
+ */
+@Injectable()
+export class AuthService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly otp: OtpService,
+    private readonly rateLimit: RateLimitService,
+    private readonly identity: IdentityService,
+    private readonly sessions: SessionService,
+    private readonly revocation: SessionRevocationService,
+    private readonly tokens: TokenService,
+    private readonly authEvents: AuthEventService,
+    private readonly google: GoogleTokenVerifier,
+    private readonly apple: AppleTokenVerifier,
+    private readonly config: ConfigService,
+    private readonly loginMethods: LoginMethodPolicy,
+    private readonly newDevice: NewDeviceNotifier,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    private readonly bans: AccountBansService,
+    private readonly assistantCodes: AssistantCodeService,
+    // Owner 2026-10-05 (docs/CLIENT_FRAUD.md): a blocked fraudster's new
+    // account (same phone, e-mail, card or device) is refused.
+    @Optional() private readonly fraud?: ClientFraudService,
+    // Owner 2026-10-07: admin-editable daily OTP cap per phone / e-mail.
+    @Optional() private readonly settings?: AppSettingsService,
+  ) {}
+
+  // ---------------------------------------------------------------------
+  // POST /auth/otp/request
+  // ---------------------------------------------------------------------
+  async requestOtp(dto: OtpRequestDto, meta: RequestMeta): Promise<void> {
+    // Before any rate-limit budget or provider spend (feature flag
+    // phone_login / email_login).
+    await this.loginMethods.assertEnabled(dto.channel);
+    const identifier = this.normalize(dto.channel, dto.identifier);
+    // Owner 2026-10-02: a blocked phone, e-mail or device gets no code.
+    await this.bans.assertAllowed({
+      phone: dto.channel === 'phone' ? identifier : null,
+      email: dto.channel === 'email' ? identifier : null,
+      deviceId: meta.deviceId,
+    });
+    // The account that already owns this phone / e-mail is not its own
+    // "repeat": a suspended account still gets 200 here and its
+    // ACCOUNT_SUSPENDED at verify (no account enumeration).
+    const owner = this.fraud
+      ? await this.prisma.userIdentifier.findUnique({
+          where: {
+            provider_provider_uid: {
+              provider: dto.channel,
+              provider_uid: identifier,
+            },
+          },
+          select: { user_id: true },
+        })
+      : null;
+    await this.fraud?.assertSignInAllowed(
+      {
+        phone: dto.channel === 'phone' ? identifier : null,
+        email: dto.channel === 'email' ? identifier : null,
+        deviceKey: meta.deviceKey,
+      },
+      owner?.user_id ?? null,
+    );
+
+    const perIdentifier = await this.rateLimit.consumeSlidingWindow(
+      ['otp-req', 'id', this.rateLimit.hashIdentifier(identifier)],
+      this.limit(ENV.otpPerIdentifierPerHour),
+      OTP_LIMIT_WINDOW_SECONDS,
+    );
+    const perIp = meta.ip
+      ? await this.rateLimit.consumeFixedWindow(
+          ['otp-req', 'ip', meta.ip],
+          this.limit(ENV.otpPerIpPerHour),
+          OTP_LIMIT_WINDOW_SECONDS,
+        )
+      : { allowed: true, retryAfterSeconds: 0, remaining: 0 };
+    // docs/01_FOUNDATION_AUTH.md §10.2: "10/час на IP/устройство". The
+    // device id is client-supplied, so this only slows a naive script
+    // down — the per-IP limit and CostGuardService's global budget are
+    // what actually bound spend. Hashed like identifiers (no raw client
+    // strings in Redis keys).
+    const perDevice = meta.deviceId
+      ? await this.rateLimit.consumeFixedWindow(
+          ['otp-req', 'dev', this.rateLimit.hashIdentifier(meta.deviceId)],
+          this.limit(ENV.otpPerDevicePerHour),
+          OTP_LIMIT_WINDOW_SECONDS,
+        )
+      : { allowed: true, retryAfterSeconds: 0, remaining: 0 };
+
+    if (!perIdentifier.allowed || !perIp.allowed || !perDevice.allowed) {
+      throw new HttpException(
+        {
+          code: ErrorCode.AUTH_OTP_REQUEST_LIMIT,
+          message: 'Too many OTP requests. Try again later.',
+          details: {
+            retryAfterSeconds: Math.max(
+              perIdentifier.allowed ? 0 : perIdentifier.retryAfterSeconds,
+              perIp.allowed ? 0 : perIp.retryAfterSeconds,
+              perDevice.allowed ? 0 : perDevice.retryAfterSeconds,
+            ),
+          },
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // Owner 2026-10-07: at most N codes a day to one phone / e-mail
+    // (rolling 24 h). Consumed only once the short limits pass, so the
+    // day's budget counts codes actually sent, not refused retries.
+    const perIdentifierDaily = await this.rateLimit.consumeSlidingWindow(
+      ['otp-req-day', 'id', this.rateLimit.hashIdentifier(identifier)],
+      await this.otpDailyLimit(),
+      OTP_DAILY_WINDOW_SECONDS,
+    );
+    if (!perIdentifierDaily.allowed) {
+      throw new HttpException(
+        {
+          code: ErrorCode.AUTH_OTP_REQUEST_LIMIT,
+          message: 'Too many OTP requests. Try again later.',
+          details: { retryAfterSeconds: perIdentifierDaily.retryAfterSeconds },
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // docs/01_FOUNDATION_AUTH.md §10.6: identical response whether or not
+    // an account exists for this identifier — OtpService.requestOtp
+    // already never looks the account up, so this is naturally true.
+    await this.otp.requestOtp(
+      dto.channel,
+      identifier,
+      'login',
+      dto.channel === 'email' ? dto.linkChallenge : undefined,
+    );
+    await this.authEvents.record({
+      eventType: AUTH_EVENT_TYPES.OTP_REQUESTED,
+      success: true,
+      identifier,
+      ip: meta.ip,
+      userAgent: meta.userAgent,
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // POST /auth/otp/verify
+  // ---------------------------------------------------------------------
+  async verifyOtp(
+    dto: OtpVerifyDto,
+    meta: RequestMeta,
+  ): Promise<AuthTokensResult> {
+    // A code requested before the method was switched off must not still
+    // mint a session afterwards.
+    await this.loginMethods.assertEnabled(dto.channel);
+    await this.loginMethods.assertPlatformAllowed(dto.deviceInfo?.platform);
+    const identifier = this.normalize(dto.channel, dto.identifier);
+    const deviceInfo: DeviceInfo = dto.deviceInfo ?? {};
+
+    // Security audit 2026-10-01: one IP can't spray wrong codes at many
+    // accounts (and lock them out) — 30 verifies an hour per IP.
+    const ipLimit = meta.ip
+      ? await this.rateLimit.consumeSlidingWindow(
+          ['otp-verify', 'ip', meta.ip],
+          this.limit(ENV.otpVerifyPerIpPerHour),
+          OTP_LIMIT_WINDOW_SECONDS,
+        )
+      : { allowed: true, retryAfterSeconds: 0 };
+    const idLimit = await this.rateLimit.consumeSlidingWindow(
+      ['otp-verify', this.rateLimit.hashIdentifier(identifier)],
+      this.limit(ENV.otpVerifyPerHour),
+      OTP_LIMIT_WINDOW_SECONDS,
+    );
+    const verifyLimit = !ipLimit.allowed ? ipLimit : idLimit;
+    if (!verifyLimit.allowed) {
+      throw new HttpException(
+        {
+          code: ErrorCode.RATE_LIMITED,
+          message: 'Too many verification attempts. Try again later.',
+          details: { retryAfterSeconds: verifyLimit.retryAfterSeconds },
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    const result = await this.otp.verifyOtp(
+      dto.channel,
+      identifier,
+      dto.code,
+      'login',
+    );
+
+    if (result !== 'ok') {
+      await this.authEvents.record({
+        eventType:
+          result === 'locked'
+            ? AUTH_EVENT_TYPES.OTP_LOCKED
+            : AUTH_EVENT_TYPES.OTP_VERIFY_FAILED,
+        success: false,
+        identifier,
+        deviceId: deviceInfo.deviceId,
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+        meta: { reason: result },
+      });
+      if (result === 'locked') {
+        throw new HttpException(
+          {
+            code: ErrorCode.AUTH_OTP_LOCKED,
+            message:
+              'Too many incorrect codes. This code is temporarily locked.',
+          },
+          HttpStatus.LOCKED,
+        );
+      }
+      if (result === 'expired') {
+        throw new UnauthorizedException({
+          code: ErrorCode.AUTH_OTP_EXPIRED,
+          message: 'Code expired. Request a new one.',
+        });
+      }
+      throw new UnauthorizedException({
+        code: ErrorCode.AUTH_OTP_INVALID,
+        message: 'Incorrect code.',
+      });
+    }
+
+    return this.completeOtpLogin(dto.channel, identifier, deviceInfo, meta);
+  }
+
+  // ---------------------------------------------------------------------
+  // POST /auth/otp/verify-link (email magic link, docs/01 §10.2 E)
+  // ---------------------------------------------------------------------
+  async verifyOtpLink(
+    dto: OtpVerifyLinkDto,
+    meta: RequestMeta,
+  ): Promise<AuthTokensResult> {
+    await this.loginMethods.assertEnabled('email');
+    await this.loginMethods.assertPlatformAllowed(dto.deviceInfo?.platform);
+    const deviceInfo: DeviceInfo = dto.deviceInfo ?? {};
+    const perIp = meta.ip
+      ? await this.rateLimit.consumeFixedWindow(
+          ['otp-link', 'ip', meta.ip],
+          this.limit(ENV.otpVerifyPerHour),
+          OTP_LIMIT_WINDOW_SECONDS,
+        )
+      : { allowed: true, retryAfterSeconds: 0, remaining: 0 };
+    if (!perIp.allowed) {
+      throw new HttpException(
+        {
+          code: ErrorCode.RATE_LIMITED,
+          message: 'Too many verification attempts. Try again later.',
+          details: { retryAfterSeconds: perIp.retryAfterSeconds },
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+    const redeemed = await this.otp.consumeLinkToken(dto.token, dto.verifier);
+    if (!redeemed) {
+      await this.authEvents.record({
+        eventType: AUTH_EVENT_TYPES.OTP_VERIFY_FAILED,
+        success: false,
+        deviceId: deviceInfo.deviceId,
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+        meta: { reason: 'link_invalid' },
+      });
+      throw new UnauthorizedException({
+        code: ErrorCode.AUTH_OTP_INVALID,
+        message: 'This sign-in link is invalid or has expired.',
+      });
+    }
+    return this.completeOtpLogin('email', redeemed.email, deviceInfo, meta);
+  }
+
+  /** Shared tail of a successful OTP (typed code or magic link): identity,
+   * account-state checks, session, audit and new-device alert. */
+  private async completeOtpLogin(
+    channel: 'phone' | 'email',
+    identifier: string,
+    deviceInfo: DeviceInfo,
+    meta: RequestMeta,
+  ): Promise<AuthTokensResult> {
+    await this.bans.assertAllowed({
+      phone: channel === 'phone' ? identifier : null,
+      email: channel === 'email' ? identifier : null,
+      deviceId: deviceInfo.deviceId,
+    });
+    // Identity resolution + the suspended/deleted/deletion-pending checks
+    // happen in one transaction; session issuance is a separate step (see
+    // docs/CHANGELOG.md stage 1.4: the OTP was already single-use-consumed
+    // by the Lua verify script above, so a failure here can't be silently
+    // retried with the same code either way — a bigger transaction
+    // wouldn't change that failure mode, only delay it).
+    const { user, isNewUser, deletionCancelled } = await withTxRetry(
+      this.prisma,
+      async (tx) => {
+        const found = await this.identity.findOrCreateForOtp(
+          channel,
+          identifier,
+          tx,
+        );
+        if (found.user.status === 'deletion_pending') {
+          const updated = await tx.user.update({
+            where: { id: found.user.id },
+            data: { status: 'active', deletion_requested_at: null },
+          });
+          return {
+            user: updated,
+            isNewUser: found.isNewUser,
+            deletionCancelled: true,
+          };
+        }
+        return {
+          user: found.user,
+          isNewUser: found.isNewUser,
+          deletionCancelled: false,
+        };
+      },
+    );
+
+    if (user.status === 'suspended') {
+      await this.authEvents.record({
+        userId: user.id,
+        eventType: AUTH_EVENT_TYPES.LOGIN_BLOCKED_SUSPENDED,
+        success: false,
+        identifier,
+        deviceId: deviceInfo.deviceId,
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+      });
+      throw new ForbiddenException({
+        code: ErrorCode.ACCOUNT_SUSPENDED,
+        message: 'This account has been suspended.',
+      });
+    }
+    if (user.status === 'deleted') {
+      await this.authEvents.record({
+        userId: user.id,
+        eventType: AUTH_EVENT_TYPES.LOGIN_BLOCKED_DELETED,
+        success: false,
+        identifier,
+        deviceId: deviceInfo.deviceId,
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+      });
+      throw new ForbiddenException({
+        code: ErrorCode.ACCOUNT_DELETED,
+        message: 'This account has been deleted.',
+      });
+    }
+    if (deletionCancelled) {
+      await this.authEvents.record({
+        userId: user.id,
+        eventType: AUTH_EVENT_TYPES.ACCOUNT_DELETION_CANCELLED,
+        success: true,
+        identifier,
+        deviceId: deviceInfo.deviceId,
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+      });
+    }
+
+    // Owner 2026-10-01: one phone + one website per account. Another
+    // phone (or browser) already signed in: ask first — the sign-in
+    // continues with POST /auth/login/continue, which signs that one out.
+    const other = await this.sessions.otherActiveDevice(user.id, deviceInfo);
+    if (other) {
+      const pendingToken = randomBytes(24).toString('base64url');
+      await this.redis.set(
+        `auth:pending:${pendingToken}`,
+        JSON.stringify({ userId: user.id, isNewUser, identifier, deviceInfo }),
+        'EX',
+        PENDING_LOGIN_TTL_SEC,
+      );
+      throw new ConflictException({
+        code: ErrorCode.AUTH_OTHER_DEVICE_ACTIVE,
+        message:
+          'This account is signed in on another device. Continue to sign it out there.',
+        details: {
+          pendingToken,
+          deviceName: other.device_name,
+          platform: other.platform,
+          lastUsedAt: other.last_used_at?.toISOString() ?? null,
+        },
+      });
+    }
+    return this.issueLogin(user, isNewUser, identifier, deviceInfo, meta);
+  }
+
+  /** POST /auth/login/continue — the user chose to sign the other device
+   * out (owner 2026-10-01). */
+  async continueLogin(
+    pendingToken: string,
+    meta: RequestMeta,
+  ): Promise<AuthTokensResult> {
+    const key = `auth:pending:${pendingToken}`;
+    // Atomic single use: two parallel calls can't both redeem it.
+    const raw = await this.redis.getdel(key);
+    if (!raw) {
+      throw new UnauthorizedException({
+        code: ErrorCode.AUTH_OTP_EXPIRED,
+        message: 'This sign-in expired. Sign in again.',
+      });
+    }
+    const p = JSON.parse(raw) as {
+      userId: string;
+      isNewUser: boolean;
+      identifier: string;
+      deviceInfo: DeviceInfo;
+    };
+    await this.loginMethods.assertPlatformAllowed(p.deviceInfo.platform);
+    const user = await this.prisma.user.findUniqueOrThrow({
+      where: { id: p.userId },
+    });
+    if (user.status === 'suspended' || user.status === 'deleted') {
+      throw new ForbiddenException({
+        code:
+          user.status === 'suspended'
+            ? ErrorCode.ACCOUNT_SUSPENDED
+            : ErrorCode.ACCOUNT_DELETED,
+        message: 'This account is not available.',
+      });
+    }
+    return this.issueLogin(user, p.isNewUser, p.identifier, p.deviceInfo, meta);
+  }
+
+  /**
+   * POST /auth/assistant/code (owner 2026-10-04): the assistant's sign-in
+   * with the attorney's one-time code, no SMS. Rate limited per IP and per
+   * device (the code space is ~59 bits; this keeps guessing hopeless).
+   */
+  async assistantCodeLogin(
+    dto: AssistantCodeLoginDto,
+    meta: RequestMeta,
+  ): Promise<AuthTokensResult> {
+    const deviceInfo: DeviceInfo = dto.deviceInfo ?? {};
+    await this.bans.assertAllowed({ deviceId: deviceInfo.deviceId });
+    const limits = [
+      ...(meta.ip
+        ? [
+            await this.rateLimit.consumeFixedWindow(
+              ['assist-login', 'ip', meta.ip],
+              20,
+              3600,
+            ),
+          ]
+        : []),
+      ...(deviceInfo.deviceId
+        ? [
+            await this.rateLimit.consumeFixedWindow(
+              ['assist-login', 'device', deviceInfo.deviceId],
+              10,
+              3600,
+            ),
+          ]
+        : []),
+    ];
+    const blocked = limits.filter((r) => !r.allowed);
+    if (blocked.length > 0) {
+      throw new HttpException(
+        {
+          code: ErrorCode.RATE_LIMITED,
+          message: 'Too many attempts. Try again later.',
+          details: {
+            retryAfterSeconds: Math.max(
+              ...blocked.map((r) => r.retryAfterSeconds),
+            ),
+          },
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    let seat;
+    try {
+      seat = await this.assistantCodes.find(dto.code);
+    } catch (e) {
+      await this.authEvents.record({
+        eventType: AUTH_EVENT_TYPES.ASSISTANT_CODE_FAILED,
+        success: false,
+        deviceId: deviceInfo.deviceId,
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+      });
+      throw e;
+    }
+
+    // A joined assistant on a new phone: the same account. Otherwise a new
+    // account that only ever works inside this attorney's team.
+    const existing = seat.assistant_user_id
+      ? await this.prisma.user.findUnique({
+          where: { id: seat.assistant_user_id },
+        })
+      : null;
+    if (existing && existing.status !== 'active') {
+      throw new ForbiddenException({
+        code:
+          existing.status === 'suspended'
+            ? ErrorCode.ACCOUNT_SUSPENDED
+            : ErrorCode.ACCOUNT_DELETED,
+        message: 'This account is not available.',
+      });
+    }
+    const isNewUser = existing === null;
+    const user =
+      existing ??
+      (await this.prisma.user.create({
+        data: { status: 'active', role: 'assistant' },
+      }));
+    await this.assistantCodes.claim(seat, user.id);
+    // One account, one phone: a code issued again moves the assistant.
+    if (!isNewUser) {
+      await this.revocation.revokeAllChainsForUser(
+        user.id,
+        'signed_in_elsewhere',
+      );
+    }
+    return this.issueLogin(
+      { ...user, role: 'assistant' },
+      isNewUser,
+      'assistant-code',
+      deviceInfo,
+      meta,
+    );
+  }
+
+  /** Session, tokens, audit and the new-device alert of a sign-in. */
+  private async issueLogin(
+    user: User,
+    isNewUser: boolean,
+    identifier: string,
+    deviceInfo: DeviceInfo,
+    meta: RequestMeta,
+  ): Promise<AuthTokensResult> {
+    await this.bans.assertAllowed({
+      userId: user.id,
+      phone: user.phone_e164,
+      email: user.email,
+      deviceId: deviceInfo.deviceId,
+    });
+    const fraudSignals = {
+      phone: user.phone_e164,
+      email: user.email,
+      deviceKey: meta.deviceKey,
+      ip: meta.ip,
+    };
+    await this.fraud?.assertSignInAllowed(fraudSignals, user.id);
+    const isNewDevice = await this.sessions.isNewDevice(
+      user.id,
+      deviceInfo.deviceId,
+    );
+    const { session, refreshTokenRaw } = await this.sessions.createSession(
+      user.id,
+      deviceInfo,
+      meta,
+    );
+    const accessToken = this.tokens.signAccessToken({
+      sub: user.id,
+      role: user.role,
+      sid: session.session_chain_id,
+      verified: false,
+      subscriptionStatus: 'none',
+    });
+
+    await this.authEvents.record({
+      userId: user.id,
+      eventType: identifier.startsWith('social:')
+        ? AUTH_EVENT_TYPES.SOCIAL_LOGIN_SUCCESS
+        : identifier === 'assistant-code'
+          ? AUTH_EVENT_TYPES.ASSISTANT_CODE_LOGIN
+          : AUTH_EVENT_TYPES.OTP_VERIFY_SUCCESS,
+      success: true,
+      identifier,
+      deviceId: deviceInfo.deviceId,
+      ip: meta.ip,
+      userAgent: meta.userAgent,
+      meta: { isNewUser, isNewDevice },
+    });
+
+    // docs/01 §10.6 new-device alert: audit row inline, delivery detached.
+    await this.newDevice.onLogin({
+      user,
+      isNewUser,
+      isNewDevice,
+      device: deviceInfo,
+      meta,
+    });
+
+    // Hashes of this sign-in's signals + re-score (never fails the login).
+    await this.fraud?.recordSignIn(user.id, fraudSignals);
+
+    return {
+      accessToken,
+      refreshToken: refreshTokenRaw,
+      accessTokenExpiresIn: this.tokens.accessTtlSecondsValue(),
+      isNewUser,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // POST /auth/refresh
+  // ---------------------------------------------------------------------
+  async refresh(
+    dto: RefreshTokenDto,
+    meta: RequestMeta,
+  ): Promise<AuthTokensResult> {
+    if (meta.ip) {
+      const ipLimit = await this.rateLimit.consumeFixedWindow(
+        ['refresh', 'ip', meta.ip],
+        this.limit(ENV.refreshPerIpPerHour),
+        3600,
+      );
+      if (!ipLimit.allowed) {
+        throw new HttpException(
+          {
+            code: ErrorCode.RATE_LIMITED,
+            message: 'Too many refresh attempts. Try again later.',
+            details: { retryAfterSeconds: ipLimit.retryAfterSeconds },
+          },
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+    }
+
+    const deviceInfo: DeviceInfo = dto.deviceInfo ?? {};
+    const outcome = await this.sessions.rotate(
+      dto.refreshToken,
+      deviceInfo,
+      meta,
+    );
+
+    if (outcome.status === 'invalid') {
+      throw new UnauthorizedException({
+        code: ErrorCode.AUTH_REFRESH_INVALID,
+        message: 'Refresh token is invalid.',
+      });
+    }
+    if (outcome.status === 'signed_in_elsewhere') {
+      throw new UnauthorizedException({
+        code: ErrorCode.AUTH_SIGNED_IN_ELSEWHERE,
+        message: 'This account signed in on another device.',
+      });
+    }
+    if (outcome.status === 'expired') {
+      throw new UnauthorizedException({
+        code: ErrorCode.AUTH_REFRESH_EXPIRED,
+        message: 'Refresh token has expired.',
+      });
+    }
+    if (outcome.status === 'reuse_detected') {
+      throw new UnauthorizedException({
+        code: ErrorCode.AUTH_REFRESH_REUSE_DETECTED,
+        message:
+          'Refresh token reuse detected; all sessions for this device chain were revoked.',
+      });
+    }
+    if (outcome.status === 'blocked') {
+      throw new ForbiddenException(
+        outcome.reason === 'suspended'
+          ? {
+              code: ErrorCode.ACCOUNT_SUSPENDED,
+              message: 'This account has been suspended.',
+            }
+          : {
+              code: ErrorCode.ACCOUNT_DELETED,
+              message: 'This account has been deleted.',
+            },
+      );
+    }
+    if (outcome.status === 'rate_limited') {
+      throw new HttpException(
+        {
+          code: ErrorCode.RATE_LIMITED,
+          message:
+            'Too many refresh attempts for this session. Try again later.',
+          details: { retryAfterSeconds: outcome.retryAfterSeconds },
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    // Turning `web_client` off also ends web sessions: the rotated token is
+    // never handed out, so the browser is signed out on its next refresh.
+    await this.loginMethods.assertPlatformAllowed(
+      outcome.session.platform ?? undefined,
+    );
+
+    // withDeleted: the session row, not users.deleted_at, decides whether
+    // a refresh is valid (account deletion revokes sessions); keep seeing
+    // the account here instead of throwing P2025 (docs/02 §1.4 opt-out).
+    const user = await this.prisma.user.findUniqueOrThrow({
+      where: withDeleted({ id: outcome.session.user_id }),
+    });
+    const accessToken = this.tokens.signAccessToken({
+      sub: user.id,
+      role: user.role,
+      sid: outcome.session.session_chain_id,
+      verified: false,
+      subscriptionStatus: 'none',
+    });
+
+    return {
+      accessToken,
+      refreshToken: outcome.refreshTokenRaw,
+      accessTokenExpiresIn: this.tokens.accessTtlSecondsValue(),
+      isNewUser: false,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // POST /auth/logout, /auth/logout-all
+  // ---------------------------------------------------------------------
+  async logout(user: RequestUser): Promise<void> {
+    await this.revocation.revokeChain(user.sid, 'logout');
+    await this.authEvents.record({
+      userId: user.sub,
+      eventType: AUTH_EVENT_TYPES.LOGOUT,
+      success: true,
+    });
+  }
+
+  async logoutAll(user: RequestUser): Promise<void> {
+    await this.revocation.revokeAllChainsForUser(user.sub, 'logout_all');
+    await this.authEvents.record({
+      userId: user.sub,
+      eventType: AUTH_EVENT_TYPES.LOGOUT_ALL,
+      success: true,
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // GET /auth/sessions, DELETE /auth/sessions/:id
+  // ---------------------------------------------------------------------
+  async listSessions(user: RequestUser): Promise<SessionListItem[]> {
+    const chains = await this.sessions.listActiveChains(user.sub);
+    return chains.map((s) => ({
+      sessionId: s.session_chain_id,
+      deviceId: s.device_id,
+      deviceName: s.device_name,
+      platform: s.platform,
+      appVersion: s.app_version,
+      lastUsedAt: s.last_used_at?.toISOString() ?? null,
+      createdAt: s.created_at.toISOString(),
+      isCurrent: s.session_chain_id === user.sid,
+    }));
+  }
+
+  async endSession(user: RequestUser, sessionChainId: string): Promise<void> {
+    const owns = await this.sessions.belongsToUser(sessionChainId, user.sub);
+    if (!owns) {
+      // docs/CHANGELOG.md stage 1.4: 404, not 403 — don't confirm to the
+      // caller whether a session id exists at all for someone else.
+      throw new NotFoundException({
+        code: ErrorCode.NOT_FOUND,
+        message: 'Session not found.',
+      });
+    }
+    await this.revocation.revokeChain(sessionChainId, 'logout');
+    await this.authEvents.record({
+      userId: user.sub,
+      eventType: AUTH_EVENT_TYPES.SESSION_REVOKED,
+      success: true,
+      meta: { sessionChainId, wasCurrentSession: user.sid === sessionChainId },
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // POST /auth/reauth
+  // ---------------------------------------------------------------------
+  async reauth(
+    dto: ReauthDto,
+    user: RequestUser,
+  ): Promise<{ reauthToken: string }> {
+    const account = await this.prisma.user.findUniqueOrThrow({
+      where: withDeleted({ id: user.sub }),
+    });
+    const channel: 'phone' | 'email' | null =
+      account.phone_verified_at && account.phone_e164 === dto.identifier
+        ? 'phone'
+        : account.email_verified_at &&
+            account.email?.toLowerCase() === dto.identifier.toLowerCase()
+          ? 'email'
+          : null;
+
+    if (!channel) {
+      // Doesn't distinguish "not yours" from "not verified" — both are
+      // just REAUTH_INVALID to the caller, same anti-enumeration spirit
+      // as OTP request/verify.
+      await this.authEvents.record({
+        userId: user.sub,
+        eventType: AUTH_EVENT_TYPES.REAUTH_FAILED,
+        success: false,
+        identifier: dto.identifier,
+      });
+      throw new UnauthorizedException({
+        code: ErrorCode.REAUTH_INVALID,
+        message: 'Identifier is not a verified contact on this account.',
+      });
+    }
+
+    const result = await this.otp.verifyOtp(
+      channel,
+      dto.identifier,
+      dto.code,
+      'login',
+    );
+    if (result !== 'ok') {
+      await this.authEvents.record({
+        userId: user.sub,
+        eventType: AUTH_EVENT_TYPES.REAUTH_FAILED,
+        success: false,
+        identifier: dto.identifier,
+        meta: { reason: result },
+      });
+      throw new UnauthorizedException({
+        code: ErrorCode.REAUTH_INVALID,
+        message: 'Incorrect or expired code.',
+      });
+    }
+
+    const reauthToken = this.tokens.signReauthToken({
+      sub: user.sub,
+      sid: user.sid,
+    });
+    await this.authEvents.record({
+      userId: user.sub,
+      eventType: AUTH_EVENT_TYPES.REAUTH_SUCCESS,
+      success: true,
+      identifier: dto.identifier,
+    });
+    return { reauthToken };
+  }
+
+  // ---------------------------------------------------------------------
+  // POST /auth/identifiers
+  // ---------------------------------------------------------------------
+  async linkIdentifier(
+    dto: LinkIdentifierDto,
+    user: RequestUser,
+  ): Promise<void> {
+    let providerUid: string;
+
+    if (dto.provider === 'phone' || dto.provider === 'email') {
+      if (!dto.identifier || !dto.code) {
+        throw new UnauthorizedException({
+          code: ErrorCode.AUTH_OTP_INVALID,
+          message: 'identifier and code are required for phone/email linking.',
+        });
+      }
+      const identifier = this.normalize(dto.provider, dto.identifier);
+      const result = await this.otp.verifyOtp(
+        dto.provider,
+        identifier,
+        dto.code,
+        'login',
+      );
+      if (result !== 'ok') {
+        throw new UnauthorizedException({
+          code: ErrorCode.AUTH_OTP_INVALID,
+          message: 'Incorrect or expired code.',
+        });
+      }
+      providerUid = identifier;
+    } else {
+      if (!dto.idToken || !dto.nonce) {
+        throw new UnauthorizedException({
+          code: ErrorCode.AUTH_SOCIAL_TOKEN_INVALID,
+          message: 'idToken and nonce are required for apple/google linking.',
+        });
+      }
+      const verifier = dto.provider === 'apple' ? this.apple : this.google;
+      const verified = await verifier.verify(dto.idToken, dto.nonce);
+      providerUid = verified.providerUid;
+    }
+
+    const linkResult = await this.identity.linkIdentifier(
+      user.sub,
+      dto.provider,
+      providerUid,
+    );
+    if (!linkResult.linked) {
+      throw new HttpException(
+        {
+          code: ErrorCode.IDENTIFIER_ALREADY_LINKED,
+          message:
+            linkResult.reason === 'already_linked_here'
+              ? 'This identifier is already linked to your account.'
+              : 'This identifier is already linked to a different account.',
+        },
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    await this.authEvents.record({
+      userId: user.sub,
+      eventType: AUTH_EVENT_TYPES.IDENTIFIER_LINKED,
+      success: true,
+      meta: { provider: dto.provider },
+    });
+  }
+
+  private normalize(channel: 'phone' | 'email', identifier: string): string {
+    return channel === 'email'
+      ? identifier.trim().toLowerCase()
+      : identifier.trim();
+  }
+
+  /** Reads an already-validated/coerced numeric env via ConfigService —
+   * never process.env directly (that would read the raw string and skip
+   * envSchema's zod coercion/defaulting, the same mistake this module
+   * already caught and fixed once in SessionService.gracePeriodMs()). */
+  private limit(key: (typeof ENV)[keyof typeof ENV]): number {
+    return this.config.getOrThrow<number>(key);
+  }
+
+  /** `security.otp_per_identifier_per_day` when an admin saved a valid
+   * value, else OTP_RATE_LIMIT_PER_IDENTIFIER_PER_DAY. A settings read
+   * failure falls back to the env (the cap stays on). */
+  private async otpDailyLimit(): Promise<number> {
+    let stored: number | null = null;
+    try {
+      stored =
+        (await this.settings?.storedNumber(
+          'security.otp_per_identifier_per_day',
+        )) ?? null;
+    } catch {
+      stored = null;
+    }
+    return otpDailyLimit(stored, this.limit(ENV.otpPerIdentifierPerDay));
+  }
+}
+
+/** How long "continue and sign the other device out" stays possible. */
+const PENDING_LOGIN_TTL_SEC = 300;

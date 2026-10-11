@@ -1,0 +1,6 @@
+{$API_HOST} {
+	reverse_proxy api:3000
+}
+{$S3_HOST} {
+	reverse_proxy s3:9000
+}

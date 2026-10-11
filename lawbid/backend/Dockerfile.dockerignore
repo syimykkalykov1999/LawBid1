@@ -1,0 +1,9 @@
+*
+!backend
+!shared/localization
+backend/node_modules
+backend/dist
+backend/test
+backend/coverage
+backend/deploy
+backend/.env*
