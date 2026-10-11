@@ -249,7 +249,7 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
     return null;
   }
 
-  static Map<String, dynamic> _tokens(String role, {bool? isNewUser}) {
+  static Map<String, dynamic> _tokens(String role, {bool isNewUser = false}) {
     String b64(Object o) =>
         base64Url.encode(utf8.encode(jsonEncode(o))).replaceAll('=', '');
     final exp = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 900;
@@ -271,7 +271,7 @@ class DemoHttpClientAdapter implements HttpClientAdapter {
       'accessToken': jwt,
       'refreshToken': 'demo-refresh-$role',
       'accessTokenExpiresIn': 900,
-      if (isNewUser != null) 'isNewUser': isNewUser,
+      'isNewUser': isNewUser,
     };
   }
 
